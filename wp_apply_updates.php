@@ -243,9 +243,9 @@ function applyUpdate(string $wpBinary, string $sitePath, array &$update): void
         return;
     }
 
-    $stdout = runWp($wpBinary, $sitePath, $args, false, $stderr, $status);
+    $stdout = runWp($wpBinary, $sitePath, $args, true, $stderr, $status);
     $update['stdout'] = trim($stdout);
-    $update['stderr'] = trim($stderr);
+    $update['stderr'] = trim((string) $stderr);
     $update['status'] = $status === 0 ? 'updated' : 'failed';
 
     if ($status !== 0) {
