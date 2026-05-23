@@ -481,25 +481,6 @@ function withoutRawRecords(array $matches): array
     return $matches;
 }
 
-function saveMatchesToMysql(array $matches, string $table, string $pluginFilter, string $feed): int
-{
-    validateTableName($table);
-    requireDbClass();
-
-    $db = createDatabase();
-
-    createResultsTable($db, $table);
-
-    $saved = 0;
-    foreach ($matches as $record) {
-        foreach ($record['software'] as $software) {
-            saveMatchRow($db, $table, $record, $software, $pluginFilter, $feed);
-            $saved++;
-        }
-    }
-
-    return $saved;
-}
 function createResultsTable(DB $db, string $table): void
 {
     $db->execute("
