@@ -192,7 +192,7 @@ function runWpJson(string $wpBinary, string $sitePath, array $args, bool $allowN
 
     $decoded = json_decode($output, true);
     if (!is_array($decoded)) {
-        if ($allowNoUpdates && preg_match('/(already|latest|success|no updates)/i', $output)) {
+        if ($allowNoUpdates && isWpNoUpdatesOutput($output)) {
             return [];
         }
 
@@ -207,11 +207,21 @@ function runWp(string $wpBinary, string $sitePath, array $args, bool $allowNoUpd
     $command = array_merge([$wpBinary, '--path=' . $sitePath], $args);
     $stdout = runCommand($command, $stderr, $status, false);
 
-    if ($status !== 0 && !$allowNoUpdates) {
+    if ($status !== 0) {
+        $combinedOutput = trim($stdout . "\n" . $stderr);
+        if ($allowNoUpdates && isWpNoUpdatesOutput($combinedOutput)) {
+            return $stdout;
+        }
+
         throw new RuntimeException("WP-CLI failed: " . implode(' ', $args) . "\n" . trim($stderr));
     }
 
     return $stdout;
+}
+
+function isWpNoUpdatesOutput(string $output): bool
+{
+    return preg_match('/\b(already|latest|up to date|no updates?)\b/i', $output) === 1;
 }
 
 function runCommand(array $command, ?string &$stderr = null, ?int &$status = null, bool $throwOnFailure = true): string
