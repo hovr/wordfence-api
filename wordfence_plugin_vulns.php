@@ -239,7 +239,7 @@ function downloadJsonToCache(string $url, string $apiKey, int $timeout, string $
         CURLOPT_CONNECTTIMEOUT => 10,
         CURLOPT_TIMEOUT => $timeout,
         CURLOPT_USERAGENT => 'Wordfence Plugin Vulnerability Checker/1.0',
-        CURLOPT_FOLLOWLOCATION => true,
+        CURLOPT_FOLLOWLOCATION => false,
     ]);
 
     $success = curl_exec($curl);
