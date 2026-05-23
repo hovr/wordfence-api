@@ -25,6 +25,7 @@ function main(array $argv): void
 
     try {
         $policy = loadPolicy($policyPath);
+        assertPolicyFresh($policy, (int) ($options['max-policy-age'] ?? 86400));
         $sitePath = rtrim((string) ($options['site'] ?? $policy['site_path'] ?? ''), DIRECTORY_SEPARATOR);
         if ($sitePath === '' || !is_dir($sitePath)) {
             throw new RuntimeException('Missing or invalid site path. Pass --site or regenerate the policy with a valid site_path.');
@@ -138,6 +139,7 @@ Options:
   --notify-email=ADDR Email for manual_review notifications.
   --no-notify         Disable manual_review email notifications.
   --lock-file=PATH    Optional lock file path.
+  --max-policy-age=N  Maximum policy age in seconds before apply/dry-run fails. Default: 86400. Use 0 to disable.
 
 TEXT;
 }
@@ -155,6 +157,28 @@ function loadPolicy(string $path): array
     }
 
     return $policy;
+}
+
+function assertPolicyFresh(array $policy, int $maxAgeSeconds): void
+{
+    if ($maxAgeSeconds <= 0) {
+        return;
+    }
+
+    $generatedAt = (string) ($policy['generated_at'] ?? '');
+    $generatedTimestamp = $generatedAt === '' ? false : strtotime($generatedAt);
+    if ($generatedTimestamp === false) {
+        throw new RuntimeException('Policy is missing a valid generated_at timestamp. Regenerate the policy before applying updates.');
+    }
+
+    $age = time() - $generatedTimestamp;
+    if ($age < 0) {
+        throw new RuntimeException('Policy generated_at timestamp is in the future. Regenerate the policy before applying updates.');
+    }
+
+    if ($age > $maxAgeSeconds) {
+        throw new RuntimeException("Policy is {$age} seconds old, exceeding the {$maxAgeSeconds} second limit. Regenerate the policy before applying updates or pass --max-policy-age=0 to override.");
+    }
 }
 
 function plannedUpdates(array $policy, string $mode, array $filters): array
