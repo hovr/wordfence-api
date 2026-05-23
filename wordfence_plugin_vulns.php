@@ -657,6 +657,7 @@ function createResultsTable(DB $db, string $table): void
     $db->execute("
         CREATE TABLE IF NOT EXISTS `{$table}` (
             `vulnerability_id` varchar(64) NOT NULL,
+            `software_type` varchar(20) NOT NULL DEFAULT 'plugin',
             `software_slug` varchar(191) NOT NULL,
             `software_name` varchar(255) DEFAULT NULL,
             `plugin_filter` varchar(255) DEFAULT NULL,
@@ -675,12 +676,63 @@ function createResultsTable(DB $db, string $table): void
             `software_json` longtext,
             `raw_record_json` longtext,
             `last_seen_at` timestamp NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-            PRIMARY KEY (`vulnerability_id`, `software_slug`),
+            PRIMARY KEY (`vulnerability_id`, `software_type`, `software_slug`),
             KEY `idx_software_slug` (`software_slug`),
+            KEY `idx_software_type_slug` (`software_type`, `software_slug`),
             KEY `idx_cve` (`cve`),
             KEY `idx_published_at` (`published_at`)
         ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
     ");
+
+    migrateResultsTable($db, $table);
+}
+
+function migrateResultsTable(DB $db, string $table): void
+{
+    if (!tableColumnExists($db, $table, 'software_type')) {
+        $db->execute("ALTER TABLE `{$table}` ADD COLUMN `software_type` varchar(20) NOT NULL DEFAULT 'plugin' AFTER `vulnerability_id`");
+    }
+
+    $primaryKeyColumns = primaryKeyColumns($db, $table);
+    if ($primaryKeyColumns !== ['vulnerability_id', 'software_type', 'software_slug']) {
+        $db->execute("ALTER TABLE `{$table}` DROP PRIMARY KEY, ADD PRIMARY KEY (`vulnerability_id`, `software_type`, `software_slug`)");
+    }
+
+    if (!indexExists($db, $table, 'idx_software_type_slug')) {
+        $db->execute("ALTER TABLE `{$table}` ADD KEY `idx_software_type_slug` (`software_type`, `software_slug`)");
+    }
+}
+
+function tableColumnExists(DB $db, string $table, string $column): bool
+{
+    $result = $db->query("
+        SELECT COUNT(*) AS `count`
+        FROM INFORMATION_SCHEMA.COLUMNS
+        WHERE TABLE_SCHEMA = DATABASE()
+          AND TABLE_NAME = " . sqlString($db, $table) . "
+          AND COLUMN_NAME = " . sqlString($db, $column) . "
+    ");
+    $row = mysqli_fetch_assoc($result);
+
+    return isset($row['count']) && (int) $row['count'] > 0;
+}
+
+function primaryKeyColumns(DB $db, string $table): array
+{
+    $result = $db->query("SHOW KEYS FROM `{$table}` WHERE Key_name = 'PRIMARY' ORDER BY Seq_in_index ASC");
+    $columns = [];
+    while ($row = mysqli_fetch_assoc($result)) {
+        $columns[] = (string) $row['Column_name'];
+    }
+
+    return $columns;
+}
+
+function indexExists(DB $db, string $table, string $index): bool
+{
+    $result = $db->query("SHOW KEYS FROM `{$table}` WHERE Key_name = " . sqlString($db, $index));
+
+    return mysqli_fetch_assoc($result) !== null;
 }
 
 function saveMatchRow(DB $db, string $table, array $record, array $software, string $pluginFilter, string $feed): void
@@ -689,6 +741,11 @@ function saveMatchRow(DB $db, string $table, array $record, array $software, str
     if ($vulnerabilityId === '') {
         $vulnerabilityId = substr(sha1(json_encode($record, JSON_UNESCAPED_SLASHES)), 0, 32);
     }
+    $softwareType = (string) ($software['type'] ?? 'plugin');
+    if (!in_array($softwareType, ['plugin', 'core', 'theme'], true)) {
+        $softwareType = 'unknown';
+    }
+
     $softwareSlug = (string) ($software['slug'] ?? '');
     if ($softwareSlug === '') {
         $softwareSlug = substr(sha1((string) ($software['name'] ?? $vulnerabilityId)), 0, 16);
@@ -702,6 +759,7 @@ function saveMatchRow(DB $db, string $table, array $record, array $software, str
 
     $values = [
         'vulnerability_id' => sqlString($db, $vulnerabilityId),
+        'software_type' => sqlString($db, $softwareType),
         'software_slug' => sqlString($db, $softwareSlug),
         'software_name' => sqlNullableString($db, $software['name'] ?? null),
         'plugin_filter' => sqlString($db, $pluginFilter),
@@ -724,6 +782,7 @@ function saveMatchRow(DB $db, string $table, array $record, array $software, str
     $db->execute("
         INSERT INTO `{$table}` (
             `vulnerability_id`,
+            `software_type`,
             `software_slug`,
             `software_name`,
             `plugin_filter`,
@@ -743,6 +802,7 @@ function saveMatchRow(DB $db, string $table, array $record, array $software, str
             `raw_record_json`
         ) VALUES (
             {$values['vulnerability_id']},
+            {$values['software_type']},
             {$values['software_slug']},
             {$values['software_name']},
             {$values['plugin_filter']},

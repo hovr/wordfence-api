@@ -364,7 +364,7 @@ function buildAssetPolicy(
 ): array {
     $observedVersions = getObservedVersions($db, $versionsTable, $siteKey, $assetType, $slug);
     $currentVulns = in_array($assetType, ['plugin', 'core'], true)
-        ? findVulnerabilitiesForVersion($db, $vulnTable, $slug, $currentVersion)
+        ? findVulnerabilitiesForVersion($db, $vulnTable, $assetType, $slug, $currentVersion)
         : [];
     $normalCandidates = agedVersions($observedVersions, $currentVersion, $normalDays);
     $emergencyCandidates = agedVersions($observedVersions, $currentVersion, $emergencyDays);
@@ -452,7 +452,7 @@ function newestSafeVersion(DB $db, string $vulnTable, string $assetType, string 
 {
     for ($i = count($versions) - 1; $i >= 0; $i--) {
         $version = $versions[$i];
-        if (!in_array($assetType, ['plugin', 'core'], true) || findVulnerabilitiesForVersion($db, $vulnTable, $slug, $version) === []) {
+        if (!in_array($assetType, ['plugin', 'core'], true) || findVulnerabilitiesForVersion($db, $vulnTable, $assetType, $slug, $version) === []) {
             return $version;
         }
     }
@@ -460,12 +460,13 @@ function newestSafeVersion(DB $db, string $vulnTable, string $assetType, string 
     return null;
 }
 
-function findVulnerabilitiesForVersion(DB $db, string $vulnTable, string $slug, string $version): array
+function findVulnerabilitiesForVersion(DB $db, string $vulnTable, string $assetType, string $slug, string $version): array
 {
     $result = $db->query("
         SELECT `vulnerability_id`, `title`, `cve`, `cvss_score`, `cvss_rating`, `affected_versions_json`, `patched_versions_json`, `remediation`
         FROM `{$vulnTable}`
-        WHERE `software_slug` = " . sqlString($db, $slug) . "
+        WHERE `software_type` = " . sqlString($db, $assetType) . "
+          AND `software_slug` = " . sqlString($db, $slug) . "
     ");
 
     $vulnerabilities = [];
