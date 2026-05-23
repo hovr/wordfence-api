@@ -58,7 +58,8 @@ global $dbCon;
 			if ( !empty( $dbCon ) ) $this->link = $dbCon;
 			else {
 				
-				$this->link = mysqli_connect($this->server,$this->user,$this->pass,$this->base) or die("Connection Error " . var_dump($this->link));
+				$this->link = mysqli_connect($this->server,$this->user,$this->pass,$this->base);
+				if ( !$this->link ) throw new RuntimeException("Database connection failed: " . mysqli_connect_error());
 				$dbCon = $this->link;
 				
 			}
@@ -286,8 +287,7 @@ global $dbCon;
     function debugAndDie($query)
     {
       $this -> GetCon ();
-	  $this->debugQuery($query, "Error");
-      die("<p style=\"margin: 2px;\">".mysqli_error($this->link)."</p></div>");
+      throw new RuntimeException("Database query failed: " . mysqli_error($this->link));
     }
     /** Internal function to debug a MySQL query.\n
       * Show the query and output the resulting table if not NULL.
