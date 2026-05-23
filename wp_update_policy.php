@@ -230,21 +230,27 @@ function isWpNoUpdatesOutput(string $output): bool
 function runCommand(array $command, ?string &$stderr = null, ?int &$status = null, bool $throwOnFailure = true): string
 {
     $escaped = array_map('escapeshellarg', $command);
+    $stderrFile = tempnam(sys_get_temp_dir(), 'wp-policy-stderr-');
+    if ($stderrFile === false) {
+        throw new RuntimeException('Unable to create temporary stderr file.');
+    }
+
     $descriptor = [
         1 => ['pipe', 'w'],
-        2 => ['pipe', 'w'],
+        2 => ['file', $stderrFile, 'w'],
     ];
 
     $process = proc_open(implode(' ', $escaped), $descriptor, $pipes);
     if (!is_resource($process)) {
+        @unlink($stderrFile);
         throw new RuntimeException('Unable to run command.');
     }
 
     $stdout = stream_get_contents($pipes[1]);
-    $stderr = (string) stream_get_contents($pipes[2]);
     fclose($pipes[1]);
-    fclose($pipes[2]);
     $status = proc_close($process);
+    $stderr = (string) file_get_contents($stderrFile);
+    @unlink($stderrFile);
 
     if ($status !== 0 && $throwOnFailure) {
         throw new RuntimeException("Command failed: " . implode(' ', $command) . "\n" . trim($stderr));
