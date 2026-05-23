@@ -23,15 +23,19 @@ function main(array $argv): void
         exit(1);
     }
 
-    $policy = loadPolicy($policyPath);
-    $sitePath = rtrim((string) ($options['site'] ?? $policy['site_path'] ?? ''), DIRECTORY_SEPARATOR);
-    if ($sitePath === '' || !is_dir($sitePath)) {
-        fwrite(STDERR, "Missing or invalid site path. Pass --site or regenerate the policy with a valid site_path.\n\n");
+    try {
+        $policy = loadPolicy($policyPath);
+        $sitePath = rtrim((string) ($options['site'] ?? $policy['site_path'] ?? ''), DIRECTORY_SEPARATOR);
+        if ($sitePath === '' || !is_dir($sitePath)) {
+            throw new RuntimeException('Missing or invalid site path. Pass --site or regenerate the policy with a valid site_path.');
+        }
+
+        loadConfigForOptions(['site' => $sitePath]);
+    } catch (RuntimeException $exception) {
+        fwrite(STDERR, $exception->getMessage() . "\n\n");
         printUsage();
         exit(1);
     }
-
-    loadConfigForOptions(['site' => $sitePath]);
 
     $siteKey = (string) ($options['site-key'] ?? $policy['site_key'] ?? basename($sitePath));
     $wpBinary = (string) ($options['wp'] ?? 'wp');
