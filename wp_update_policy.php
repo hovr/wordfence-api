@@ -629,14 +629,26 @@ function defaultPolicyPath(string $siteKey): string
 
 function writeJsonFile(string $path, array $data): void
 {
-    ensureDirectory(dirname($path));
+    $directory = dirname($path);
+    ensureDirectory($directory);
     $json = json_encode($data, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES);
     if ($json === false) {
         throw new RuntimeException('Unable to encode policy JSON.');
     }
 
-    if (file_put_contents($path, $json . PHP_EOL) === false) {
-        throw new RuntimeException("Unable to write policy file: {$path}");
+    $tmpFile = tempnam($directory, '.policy-');
+    if ($tmpFile === false) {
+        throw new RuntimeException("Unable to create temporary policy file in: {$directory}");
+    }
+
+    if (file_put_contents($tmpFile, $json . PHP_EOL) === false) {
+        @unlink($tmpFile);
+        throw new RuntimeException("Unable to write temporary policy file: {$tmpFile}");
+    }
+
+    if (!rename($tmpFile, $path)) {
+        @unlink($tmpFile);
+        throw new RuntimeException("Unable to move temporary policy file into place: {$path}");
     }
 }
 
