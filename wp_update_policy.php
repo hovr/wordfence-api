@@ -8,6 +8,7 @@ declare(strict_types=1);
  *
  * Usage:
  *   php wp_update_policy.php --site=/path/to/wordpress
+ *   php wp_update_policy.php --site=/path/to/wordpress --refresh-wordfence
  *   php wp_update_policy.php --site=/path/to/wordpress --wp=/usr/local/bin/wp --normal-days=7 --emergency-days=2
  */
 
@@ -39,12 +40,19 @@ function main(array $argv): void
     $assetsTable = (string) ($options['assets-table'] ?? DEFAULT_ASSETS_TABLE);
     $versionsTable = (string) ($options['versions-table'] ?? DEFAULT_VERSIONS_TABLE);
     $output = (string) ($options['output'] ?? defaultPolicyPath($siteKey));
+    $refreshWordfence = array_key_exists('refresh-wordfence', $options);
 
     validateTableName($vulnTable);
     validateTableName($assetsTable);
     validateTableName($versionsTable);
 
+    $wordfenceRefresh = null;
+
     try {
+        if ($refreshWordfence) {
+            $wordfenceRefresh = refreshWordfence($options, $sitePath, $vulnTable);
+        }
+
         $db = createDatabase();
         createPolicyTables($db, $assetsTable, $versionsTable);
 
@@ -76,6 +84,7 @@ function main(array $argv): void
         'core_current_version' => $policy['core']['current_version'],
         'plugin_count' => count($policy['plugins']),
         'generated_at' => $policy['generated_at'],
+        'wordfence_refresh' => $wordfenceRefresh,
     ], JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES) . PHP_EOL;
 }
 
@@ -92,11 +101,58 @@ Options:
   --normal-days=N        Optional normal update delay. Default: 7.
   --emergency-days=N     Optional emergency update delay. Default: 2.
   --output=PATH          Optional policy JSON output path.
+  --refresh-wordfence    Optional. Refresh Wordfence vulnerability DB before building policy.
+  --wf-feed=VALUE        Optional with --refresh-wordfence. production or scanner. Default: production.
+  --wf-timeout=SECONDS   Optional with --refresh-wordfence. Default: 600.
+  --wf-use-cache         Optional with --refresh-wordfence. Import existing cache without download.
+  --wf-cache-file=PATH   Optional with --refresh-wordfence. Feed cache path.
   --vuln-table=VALUE     Optional Wordfence table. Default: wordfence_plugin_vulnerabilities.
   --assets-table=VALUE   Optional current asset table. Default: wp_update_assets.
   --versions-table=VALUE Optional first-seen versions table. Default: wp_update_versions.
 
 TEXT;
+}
+
+function refreshWordfence(array $options, string $sitePath, string $vulnTable): array
+{
+    $script = __DIR__ . '/wordfence_plugin_vulns.php';
+    if (!is_file($script)) {
+        throw new RuntimeException('wordfence_plugin_vulns.php was not found.');
+    }
+
+    $args = [
+        PHP_BINARY,
+        $script,
+        '--all',
+        '--software=all',
+        '--site=' . $sitePath,
+        '--table=' . $vulnTable,
+        '--feed=' . (string) ($options['wf-feed'] ?? 'production'),
+        '--timeout=' . (string) ($options['wf-timeout'] ?? '600'),
+    ];
+
+    if (isset($options['wf-cache-file'])) {
+        $args[] = '--cache-file=' . (string) $options['wf-cache-file'];
+    }
+
+    if (array_key_exists('wf-use-cache', $options)) {
+        $args[] = '--use-cache';
+    }
+
+    $output = runCommand($args, $stderr, $status, true);
+    $decoded = json_decode(trim($output), true);
+    if (!is_array($decoded) || empty($decoded['saved_to_mysql'])) {
+        throw new RuntimeException("Wordfence refresh did not complete as expected.\n" . trim($output));
+    }
+
+    return [
+        'feed' => $decoded['feed'] ?? null,
+        'software' => $decoded['software'] ?? null,
+        'count' => $decoded['count'] ?? null,
+        'matched_software_rows' => $decoded['matched_software_rows'] ?? null,
+        'saved_rows' => $decoded['saved_rows'] ?? null,
+        'cache_file' => $decoded['cache_file'] ?? null,
+    ];
 }
 
 function collectWordPressInventory(string $wpBinary, string $sitePath): array
@@ -149,6 +205,17 @@ function runWpJson(string $wpBinary, string $sitePath, array $args, bool $allowN
 function runWp(string $wpBinary, string $sitePath, array $args, bool $allowNoUpdates = false): string
 {
     $command = array_merge([$wpBinary, '--path=' . $sitePath], $args);
+    $stdout = runCommand($command, $stderr, $status, false);
+
+    if ($status !== 0 && !$allowNoUpdates) {
+        throw new RuntimeException("WP-CLI failed: " . implode(' ', $args) . "\n" . trim($stderr));
+    }
+
+    return $stdout;
+}
+
+function runCommand(array $command, ?string &$stderr = null, ?int &$status = null, bool $throwOnFailure = true): string
+{
     $escaped = array_map('escapeshellarg', $command);
     $descriptor = [
         1 => ['pipe', 'w'],
@@ -157,17 +224,17 @@ function runWp(string $wpBinary, string $sitePath, array $args, bool $allowNoUpd
 
     $process = proc_open(implode(' ', $escaped), $descriptor, $pipes);
     if (!is_resource($process)) {
-        throw new RuntimeException('Unable to run WP-CLI.');
+        throw new RuntimeException('Unable to run command.');
     }
 
     $stdout = stream_get_contents($pipes[1]);
-    $stderr = stream_get_contents($pipes[2]);
+    $stderr = (string) stream_get_contents($pipes[2]);
     fclose($pipes[1]);
     fclose($pipes[2]);
     $status = proc_close($process);
 
-    if ($status !== 0 && !$allowNoUpdates) {
-        throw new RuntimeException("WP-CLI failed: " . implode(' ', $args) . "\n" . trim((string) $stderr));
+    if ($status !== 0 && $throwOnFailure) {
+        throw new RuntimeException("Command failed: " . implode(' ', $command) . "\n" . trim($stderr));
     }
 
     return (string) $stdout;
