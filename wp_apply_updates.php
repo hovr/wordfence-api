@@ -106,7 +106,7 @@ function main(array $argv): void
         }
 
         if (is_resource($lockHandle)) {
-            releaseLock($lockHandle, $lockFile);
+            releaseLock($lockHandle);
         }
     }
 
@@ -382,11 +382,11 @@ function acquireLock(string $lockFile)
     return $handle;
 }
 
-function releaseLock($handle, string $lockFile): void
+function releaseLock($handle): void
 {
+    ftruncate($handle, 0);
     flock($handle, LOCK_UN);
     fclose($handle);
-    @unlink($lockFile);
 }
 
 function runWp(string $wpBinary, string $sitePath, array $args, bool $allowFailure = false, ?string &$stderr = null, ?int &$status = null): string
