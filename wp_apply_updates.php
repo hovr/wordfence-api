@@ -87,7 +87,7 @@ function main(array $argv): void
             }
 
             if ($maintenance) {
-                runWp($wpBinary, $sitePath, ['maintenance-mode', 'activate'], true);
+                runWp($wpBinary, $sitePath, ['maintenance-mode', 'activate']);
                 $maintenanceActive = true;
                 $summary['maintenance'] = true;
             }
