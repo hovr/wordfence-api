@@ -142,7 +142,7 @@ function refreshWordfence(array $options, string $sitePath, string $vulnTable): 
         $args[] = '--use-cache';
     }
 
-    $output = runCommand($args, $stderr, $status, true);
+    $output = runCommand($args, $stderr, $status, true, 'wp-policy-stderr-');
     $decoded = json_decode(trim($output), true);
     if (!is_array($decoded) || empty($decoded['saved_to_mysql'])) {
         throw new RuntimeException("Wordfence refresh did not complete as expected.\n" . trim($output));
@@ -208,7 +208,7 @@ function runWpJson(string $wpBinary, string $sitePath, array $args, bool $allowN
 function runWp(string $wpBinary, string $sitePath, array $args, bool $allowNoUpdates = false): string
 {
     $command = array_merge([$wpBinary, '--path=' . $sitePath], $args);
-    $stdout = runCommand($command, $stderr, $status, false);
+    $stdout = runCommand($command, $stderr, $status, false, 'wp-policy-stderr-');
 
     if ($status !== 0) {
         $combinedOutput = trim($stdout . "\n" . $stderr);
@@ -225,38 +225,6 @@ function runWp(string $wpBinary, string $sitePath, array $args, bool $allowNoUpd
 function isWpNoUpdatesOutput(string $output): bool
 {
     return preg_match('/\b(already|latest|up to date|no updates?)\b/i', $output) === 1;
-}
-
-function runCommand(array $command, ?string &$stderr = null, ?int &$status = null, bool $throwOnFailure = true): string
-{
-    $escaped = array_map('escapeshellarg', $command);
-    $stderrFile = tempnam(sys_get_temp_dir(), 'wp-policy-stderr-');
-    if ($stderrFile === false) {
-        throw new RuntimeException('Unable to create temporary stderr file.');
-    }
-
-    $descriptor = [
-        1 => ['pipe', 'w'],
-        2 => ['file', $stderrFile, 'w'],
-    ];
-
-    $process = proc_open(implode(' ', $escaped), $descriptor, $pipes);
-    if (!is_resource($process)) {
-        @unlink($stderrFile);
-        throw new RuntimeException('Unable to run command.');
-    }
-
-    $stdout = stream_get_contents($pipes[1]);
-    fclose($pipes[1]);
-    $status = proc_close($process);
-    $stderr = (string) file_get_contents($stderrFile);
-    @unlink($stderrFile);
-
-    if ($status !== 0 && $throwOnFailure) {
-        throw new RuntimeException("Command failed: " . implode(' ', $command) . "\n" . trim($stderr));
-    }
-
-    return (string) $stdout;
 }
 
 function normalizePlugins(array $plugins): array

@@ -487,45 +487,13 @@ function releaseLock($handle): void
 function runWp(string $wpBinary, string $sitePath, array $args, bool $allowFailure = false, ?string &$stderr = null, ?int &$status = null): string
 {
     $command = array_merge([$wpBinary, '--path=' . $sitePath], $args);
-    $stdout = runCommand($command, $stderr, $status, false);
+    $stdout = runCommand($command, $stderr, $status, false, 'wp-apply-stderr-');
 
     if ($status !== 0 && !$allowFailure) {
         throw new RuntimeException("WP-CLI failed: " . implode(' ', $args) . "\n" . trim((string) $stderr));
     }
 
     return $stdout;
-}
-
-function runCommand(array $command, ?string &$stderr = null, ?int &$status = null, bool $throwOnFailure = true): string
-{
-    $escaped = array_map('escapeshellarg', $command);
-    $stderrFile = tempnam(sys_get_temp_dir(), 'wp-apply-stderr-');
-    if ($stderrFile === false) {
-        throw new RuntimeException('Unable to create temporary stderr file.');
-    }
-
-    $descriptor = [
-        1 => ['pipe', 'w'],
-        2 => ['file', $stderrFile, 'w'],
-    ];
-
-    $process = proc_open(implode(' ', $escaped), $descriptor, $pipes);
-    if (!is_resource($process)) {
-        @unlink($stderrFile);
-        throw new RuntimeException('Unable to run command.');
-    }
-
-    $stdout = stream_get_contents($pipes[1]);
-    fclose($pipes[1]);
-    $status = proc_close($process);
-    $stderr = (string) file_get_contents($stderrFile);
-    @unlink($stderrFile);
-
-    if ($status !== 0 && $throwOnFailure) {
-        throw new RuntimeException("Command failed: " . implode(' ', $command) . "\n" . trim($stderr));
-    }
-
-    return (string) $stdout;
 }
 
 function parseCsvOption($value): array
