@@ -373,14 +373,15 @@ function buildAssetPolicy(
     string $status = 'active'
 ): array {
     $observedVersions = getObservedVersions($db, $versionsTable, $siteKey, $assetType, $slug);
-    $currentVulns = in_array($assetType, ['plugin', 'core'], true)
-        ? findVulnerabilitiesForVersion($db, $vulnTable, $assetType, $slug, $currentVersion)
+    $vulnerabilityRows = in_array($assetType, ['plugin', 'core'], true)
+        ? loadVulnerabilitiesForAsset($db, $vulnTable, $assetType, $slug)
         : [];
+    $currentVulns = findVulnerabilitiesForVersion($vulnerabilityRows, $currentVersion);
     $normalCandidates = agedVersions($observedVersions, $currentVersion, $normalDays);
     $emergencyCandidates = agedVersions($observedVersions, $currentVersion, $emergencyDays);
 
-    $normalVersion = newestSafeVersion($db, $vulnTable, $assetType, $slug, $normalCandidates);
-    $emergencyVersion = newestSafeVersion($db, $vulnTable, $assetType, $slug, $emergencyCandidates);
+    $normalVersion = newestSafeVersion($vulnerabilityRows, $normalCandidates);
+    $emergencyVersion = newestSafeVersion($vulnerabilityRows, $emergencyCandidates);
 
     return [
         'type' => $assetType,
@@ -458,11 +459,11 @@ function agedVersions(array $observedVersions, string $currentVersion, int $days
     return array_values(array_unique($versions));
 }
 
-function newestSafeVersion(DB $db, string $vulnTable, string $assetType, string $slug, array $versions): ?string
+function newestSafeVersion(array $vulnerabilityRows, array $versions): ?string
 {
     for ($i = count($versions) - 1; $i >= 0; $i--) {
         $version = $versions[$i];
-        if (!in_array($assetType, ['plugin', 'core'], true) || findVulnerabilitiesForVersion($db, $vulnTable, $assetType, $slug, $version) === []) {
+        if (findVulnerabilitiesForVersion($vulnerabilityRows, $version) === []) {
             return $version;
         }
     }
@@ -470,7 +471,7 @@ function newestSafeVersion(DB $db, string $vulnTable, string $assetType, string 
     return null;
 }
 
-function findVulnerabilitiesForVersion(DB $db, string $vulnTable, string $assetType, string $slug, string $version): array
+function loadVulnerabilitiesForAsset(DB $db, string $vulnTable, string $assetType, string $slug): array
 {
     $result = $db->query("
         SELECT `vulnerability_id`, `title`, `cve`, `cvss_score`, `cvss_rating`, `affected_versions_json`, `patched_versions_json`, `remediation`
@@ -482,19 +483,33 @@ function findVulnerabilitiesForVersion(DB $db, string $vulnTable, string $assetT
     $vulnerabilities = [];
     while ($row = mysqli_fetch_assoc($result)) {
         $ranges = json_decode((string) $row['affected_versions_json'], true);
-        if (!is_array($ranges) || !versionMatchesAffectedRanges($version, $ranges)) {
-            continue;
-        }
-
         $vulnerabilities[] = [
             'id' => (string) $row['vulnerability_id'],
             'title' => (string) $row['title'],
             'cve' => $row['cve'] !== null ? (string) $row['cve'] : null,
             'cvss_score' => $row['cvss_score'] !== null ? (float) $row['cvss_score'] : null,
             'cvss_rating' => $row['cvss_rating'] !== null ? (string) $row['cvss_rating'] : null,
+            'affected_versions' => is_array($ranges) ? $ranges : [],
             'patched_versions' => json_decode((string) $row['patched_versions_json'], true) ?: [],
             'remediation' => $row['remediation'] !== null ? (string) $row['remediation'] : null,
         ];
+    }
+
+    return $vulnerabilities;
+}
+
+function findVulnerabilitiesForVersion(array $vulnerabilityRows, string $version): array
+{
+    $vulnerabilities = [];
+    foreach ($vulnerabilityRows as $row) {
+        $ranges = is_array($row['affected_versions'] ?? null) ? $row['affected_versions'] : [];
+        if ($ranges === [] || !versionMatchesAffectedRanges($version, $ranges)) {
+            continue;
+        }
+
+        $match = $row;
+        unset($match['affected_versions']);
+        $vulnerabilities[] = $match;
     }
 
     return $vulnerabilities;
