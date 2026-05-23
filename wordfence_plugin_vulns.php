@@ -66,9 +66,11 @@ function main(array $argv): void
     $useCache = array_key_exists('use-cache', $options);
 
     try {
-        $feedData = $useCache ? loadCachedJson($cacheFile) : fetchJson($endpoint, $apiKey, $timeout, $cacheFile);
-        $matches = $all ? allPluginVulnerabilities($feedData) : filterPluginVulnerabilities($feedData, $plugin, $exact);
-        $saved = $save ? saveMatchesToMysql($matches, $table, $all ? 'ALL' : $pluginOption, $feed) : 0;
+        if (!$useCache) {
+            downloadJsonToCache($endpoint, $apiKey, $timeout, $cacheFile);
+        }
+
+        $result = processCachedFeed($cacheFile, $all, $plugin, $exact, $save, $table, $all ? 'ALL' : $pluginOption, $feed);
     } catch (RuntimeException $exception) {
         fwrite(STDERR, $exception->getMessage() . "\n");
         exit(1);
@@ -79,11 +81,13 @@ function main(array $argv): void
         'mode' => $all ? 'all_plugins' : 'plugin_filter',
         'plugin_filter' => $all ? null : $pluginOption,
         'match_mode' => $all ? null : ($exact ? 'exact slug/name' : 'contains slug/name'),
-        'count' => count($matches),
+        'count' => $result['matched_records'],
+        'matched_software_rows' => $result['matched_software_rows'],
         'saved_to_mysql' => $save,
-        'saved_rows' => $saved,
+        'saved_rows' => $result['saved_rows'],
         'table' => $save ? $table : null,
-        'vulnerabilities' => array_values(withoutRawRecords($matches)),
+        'cache_file' => $cacheFile,
+        'vulnerabilities' => $all ? [] : array_values(withoutRawRecords($result['matches'])),
     ];
 
     echo json_encode($output, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES) . PHP_EOL;
@@ -169,7 +173,7 @@ function parseOptions(array $argv): array
     return $options;
 }
 
-function fetchJson(string $url, string $apiKey, int $timeout, string $cacheFile): array
+function downloadJsonToCache(string $url, string $apiKey, int $timeout, string $cacheFile): void
 {
     ensureDirectory(dirname($cacheFile));
     $tmpFile = $cacheFile . '.tmp';
@@ -216,27 +220,71 @@ function fetchJson(string $url, string $apiKey, int $timeout, string $cacheFile)
         @unlink($tmpFile);
         throw new RuntimeException("Unable to move temporary cache file into place: {$cacheFile}");
     }
-
-    return loadCachedJson($cacheFile);
 }
 
-function loadCachedJson(string $cacheFile): array
+function processCachedFeed(
+    string $cacheFile,
+    bool $all,
+    string $plugin,
+    bool $exact,
+    bool $save,
+    string $table,
+    string $pluginFilter,
+    string $feed
+): array
 {
     if (!is_file($cacheFile)) {
         throw new RuntimeException("Cache file does not exist: {$cacheFile}");
     }
 
-    $response = file_get_contents($cacheFile);
-    if ($response === false) {
-        throw new RuntimeException("Unable to read cache file: {$cacheFile}");
+    $db = null;
+    if ($save) {
+        validateTableName($table);
+        requireDbClass();
+        $db = createDatabase();
+        createResultsTable($db, $table);
     }
 
-    $data = json_decode($response, true);
-    if (!is_array($data)) {
-        throw new RuntimeException("Cached Wordfence response was not valid JSON: {$cacheFile}");
+    $matches = [];
+    $matchedRecords = 0;
+    $matchedSoftwareRows = 0;
+    $savedRows = 0;
+
+    foreach (streamTopLevelJsonObject($cacheFile) as $id => $record) {
+        if (!is_array($record) || !isset($record['software']) || !is_array($record['software'])) {
+            continue;
+        }
+
+        $softwareMatches = $all
+            ? matchingPluginSoftware($record['software'])
+            : matchingFilteredPluginSoftware($record['software'], $plugin, $exact);
+
+        if ($softwareMatches === []) {
+            continue;
+        }
+
+        $outputRecord = vulnerabilityOutputRecord($record, $id, $softwareMatches);
+        $matchedRecords++;
+        $matchedSoftwareRows += count($softwareMatches);
+
+        if ($save && $db instanceof DB) {
+            foreach ($softwareMatches as $software) {
+                saveMatchRow($db, $table, $outputRecord, $software, $pluginFilter, $feed);
+                $savedRows++;
+            }
+        }
+
+        if (!$all) {
+            $matches[$id] = $outputRecord;
+        }
     }
 
-    return $data;
+    return [
+        'matched_records' => $matchedRecords,
+        'matched_software_rows' => $matchedSoftwareRows,
+        'saved_rows' => $savedRows,
+        'matches' => $matches,
+    ];
 }
 
 function defaultCacheFile(string $feed): string
@@ -264,66 +312,198 @@ function ensureDirectory(string $directory): void
     }
 }
 
-function allPluginVulnerabilities(array $feedData): array
+function streamTopLevelJsonObject(string $cacheFile): Generator
+{
+    $handle = fopen($cacheFile, 'rb');
+    if ($handle === false) {
+        throw new RuntimeException("Unable to open cache file: {$cacheFile}");
+    }
+
+    try {
+        skipJsonWhitespace($handle);
+        $first = readJsonChar($handle);
+        if ($first !== '{') {
+            throw new RuntimeException("Cached Wordfence response was not a JSON object: {$cacheFile}");
+        }
+
+        while (true) {
+            skipJsonWhitespace($handle);
+            $char = readJsonChar($handle);
+
+            if ($char === '}') {
+                break;
+            }
+
+            if ($char === null) {
+                throw new RuntimeException("Unexpected end of JSON while reading {$cacheFile}");
+            }
+
+            if ($char !== '"') {
+                throw new RuntimeException("Expected vulnerability id string in {$cacheFile}");
+            }
+
+            $id = readJsonStringAfterOpeningQuote($handle);
+            skipJsonWhitespace($handle);
+
+            if (readJsonChar($handle) !== ':') {
+                throw new RuntimeException("Expected colon after vulnerability id {$id}");
+            }
+
+            skipJsonWhitespace($handle);
+            $rawValue = readJsonValue($handle);
+            $record = json_decode($rawValue, true);
+            if (!is_array($record)) {
+                throw new RuntimeException("Invalid JSON record for vulnerability id {$id}");
+            }
+
+            yield $id => $record;
+
+            skipJsonWhitespace($handle);
+            $separator = readJsonChar($handle);
+            if ($separator === '}') {
+                break;
+            }
+
+            if ($separator !== ',') {
+                throw new RuntimeException("Expected comma after vulnerability id {$id}");
+            }
+        }
+    } finally {
+        fclose($handle);
+    }
+}
+
+function skipJsonWhitespace($handle): void
+{
+    while (($char = readJsonChar($handle)) !== null) {
+        if (!ctype_space($char)) {
+            fseek($handle, -1, SEEK_CUR);
+            return;
+        }
+    }
+}
+
+function readJsonChar($handle): ?string
+{
+    $char = fgetc($handle);
+    return $char === false ? null : $char;
+}
+
+function readJsonStringAfterOpeningQuote($handle): string
+{
+    $raw = '"';
+    $escaped = false;
+
+    while (($char = readJsonChar($handle)) !== null) {
+        $raw .= $char;
+
+        if ($escaped) {
+            $escaped = false;
+            continue;
+        }
+
+        if ($char === '\\') {
+            $escaped = true;
+            continue;
+        }
+
+        if ($char === '"') {
+            $decoded = json_decode($raw, true);
+            if (!is_string($decoded)) {
+                throw new RuntimeException('Invalid JSON object key.');
+            }
+
+            return $decoded;
+        }
+    }
+
+    throw new RuntimeException('Unexpected end of JSON while reading object key.');
+}
+
+function readJsonValue($handle): string
+{
+    $raw = '';
+    $inString = false;
+    $escaped = false;
+    $depth = 0;
+    $started = false;
+
+    while (($char = readJsonChar($handle)) !== null) {
+        if (!$started) {
+            if (ctype_space($char)) {
+                continue;
+            }
+
+            $started = true;
+        }
+
+        $raw .= $char;
+
+        if ($inString) {
+            if ($escaped) {
+                $escaped = false;
+            } elseif ($char === '\\') {
+                $escaped = true;
+            } elseif ($char === '"') {
+                $inString = false;
+            }
+
+            continue;
+        }
+
+        if ($char === '"') {
+            $inString = true;
+            continue;
+        }
+
+        if ($char === '{' || $char === '[') {
+            $depth++;
+            continue;
+        }
+
+        if ($char === '}' || $char === ']') {
+            $depth--;
+            if ($depth === 0) {
+                return $raw;
+            }
+        }
+    }
+
+    throw new RuntimeException('Unexpected end of JSON while reading value.');
+}
+
+function matchingPluginSoftware(array $softwareItems): array
 {
     $matches = [];
 
-    foreach ($feedData as $id => $record) {
-        if (!is_array($record) || !isset($record['software']) || !is_array($record['software'])) {
-            continue;
+    foreach ($softwareItems as $software) {
+        if (is_array($software) && ($software['type'] ?? null) === 'plugin') {
+            $matches[] = $software;
         }
-
-        $pluginSoftware = [];
-
-        foreach ($record['software'] as $software) {
-            if (is_array($software) && ($software['type'] ?? null) === 'plugin') {
-                $pluginSoftware[] = $software;
-            }
-        }
-
-        if ($pluginSoftware === []) {
-            continue;
-        }
-
-        $matches[$id] = vulnerabilityOutputRecord($record, $id, $pluginSoftware);
     }
 
     return $matches;
 }
 
-function filterPluginVulnerabilities(array $feedData, string $plugin, bool $exact): array
+function matchingFilteredPluginSoftware(array $softwareItems, string $plugin, bool $exact): array
 {
     $matches = [];
 
-    foreach ($feedData as $id => $record) {
-        if (!is_array($record) || !isset($record['software']) || !is_array($record['software'])) {
+    foreach ($softwareItems as $software) {
+        if (!is_array($software) || ($software['type'] ?? null) !== 'plugin') {
             continue;
         }
 
-        $matchingSoftware = [];
+        $slug = normalize((string) ($software['slug'] ?? ''));
+        $name = normalize((string) ($software['name'] ?? ''));
 
-        foreach ($record['software'] as $software) {
-            if (!is_array($software) || ($software['type'] ?? null) !== 'plugin') {
-                continue;
-            }
+        $matched = $exact
+            ? $plugin === $slug || $plugin === $name
+            : contains($slug, $plugin) || contains($name, $plugin);
 
-            $slug = normalize((string) ($software['slug'] ?? ''));
-            $name = normalize((string) ($software['name'] ?? ''));
-
-            $matched = $exact
-                ? $plugin === $slug || $plugin === $name
-                : contains($slug, $plugin) || contains($name, $plugin);
-
-            if ($matched) {
-                $matchingSoftware[] = $software;
-            }
+        if ($matched) {
+            $matches[] = $software;
         }
-
-        if ($matchingSoftware === []) {
-            continue;
-        }
-
-        $matches[$id] = vulnerabilityOutputRecord($record, $id, $matchingSoftware);
     }
 
     return $matches;
@@ -366,18 +546,10 @@ function withoutRawRecords(array $matches): array
 
 function saveMatchesToMysql(array $matches, string $table, string $pluginFilter, string $feed): int
 {
-    if (!preg_match('/^[A-Za-z0-9_]+$/', $table)) {
-        throw new RuntimeException('Invalid table name. Use letters, numbers, and underscores only.');
-    }
-
+    validateTableName($table);
     requireDbClass();
 
-    $db = new DB(
-        getRequiredConfiguredValue('DB_NAME'),
-        getRequiredConfiguredValue('DB_HOST'),
-        getRequiredConfiguredValue('DB_USER'),
-        getRequiredConfiguredValue('DB_PASSWORD')
-    );
+    $db = createDatabase();
 
     createResultsTable($db, $table);
 
@@ -390,6 +562,23 @@ function saveMatchesToMysql(array $matches, string $table, string $pluginFilter,
     }
 
     return $saved;
+}
+
+function validateTableName(string $table): void
+{
+    if (!preg_match('/^[A-Za-z0-9_]+$/', $table)) {
+        throw new RuntimeException('Invalid table name. Use letters, numbers, and underscores only.');
+    }
+}
+
+function createDatabase(): DB
+{
+    return new DB(
+        getRequiredConfiguredValue('DB_NAME'),
+        getRequiredConfiguredValue('DB_HOST'),
+        getRequiredConfiguredValue('DB_USER'),
+        getRequiredConfiguredValue('DB_PASSWORD')
+    );
 }
 
 function requireDbClass(): void
