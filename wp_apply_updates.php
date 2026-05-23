@@ -243,6 +243,12 @@ function applyUpdate(string $wpBinary, string $sitePath, array &$update): void
         return;
     }
 
+    verifyLiveVersionBeforeUpdate($wpBinary, $sitePath, $update);
+
+    if ($update['status'] === 'skipped') {
+        return;
+    }
+
     $stdout = runWp($wpBinary, $sitePath, $args, true, $stderr, $status);
     $update['stdout'] = trim($stdout);
     $update['stderr'] = trim((string) $stderr);
@@ -251,6 +257,47 @@ function applyUpdate(string $wpBinary, string $sitePath, array &$update): void
     if ($status !== 0) {
         throw new RuntimeException("Update failed for {$update['type']} {$update['slug']}: " . trim($stderr));
     }
+}
+
+function verifyLiveVersionBeforeUpdate(string $wpBinary, string $sitePath, array &$update): void
+{
+    $liveVersion = liveAssetVersion($wpBinary, $sitePath, (string) $update['type'], (string) $update['slug']);
+    $update['live_version'] = $liveVersion;
+
+    if (compareVersions($liveVersion, (string) $update['to_version']) >= 0) {
+        $update['status'] = 'skipped';
+        $update['stdout'] = null;
+        $update['stderr'] = "Live version {$liveVersion} is already at or newer than target {$update['to_version']}.";
+        return;
+    }
+
+    if (compareVersions($liveVersion, (string) $update['from_version']) !== 0) {
+        $asset = updateLabel($update);
+        $update['status'] = 'failed';
+        $update['stderr'] = "Live version {$liveVersion} does not match policy version {$update['from_version']} for {$asset}. Regenerate the policy before applying updates.";
+        throw new RuntimeException($update['stderr']);
+    }
+}
+
+function liveAssetVersion(string $wpBinary, string $sitePath, string $type, string $slug): string
+{
+    if ($type === 'core') {
+        return trim(runWp($wpBinary, $sitePath, ['core', 'version']));
+    }
+
+    if ($type === 'plugin') {
+        return trim(runWp($wpBinary, $sitePath, ['plugin', 'get', $slug, '--field=version']));
+    }
+
+    throw new RuntimeException("Unsupported update type: {$type}");
+}
+
+function updateLabel(array $update): string
+{
+    $type = (string) ($update['type'] ?? 'asset');
+    $slug = (string) ($update['slug'] ?? '');
+
+    return $slug === '' ? $type : "{$type} {$slug}";
 }
 
 function backupDatabase(string $wpBinary, string $sitePath, string $siteKey, string $backupDir): array
