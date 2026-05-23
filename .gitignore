@@ -1,3 +1,6 @@
 wp-config.php
 cache/
 policies/
+
+# Local agent/tool configuration
+.codex/
