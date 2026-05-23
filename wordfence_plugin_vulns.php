@@ -3,17 +3,19 @@ declare(strict_types=1);
 
 /**
  * Fetch the Wordfence Intelligence v3 vulnerability feed and save either all
- * plugin vulnerabilities or a locally filtered plugin subset.
+ * WordPress software vulnerabilities or a locally filtered plugin subset.
  *
  * Usage:
  *   php wordfence_plugin_vulns.php --plugin=woocommerce
  *   php wordfence_plugin_vulns.php --all
+ *   php wordfence_plugin_vulns.php --all --software=all
  *   php wordfence_plugin_vulns.php --plugin=woocommerce --feed=scanner
  *
  * Notes:
  *   Wordfence v3 production/scanner endpoints return the complete feed and do
  *   not accept filter parameters, so plugin filtering is performed client-side.
- *   The API key and database credentials are loaded from wp-config.php.
+ *   The API key and database credentials are loaded from --site/wp-config.php
+ *   first, then this script directory's wp-config.php as fallback.
  */
 
 const WORDFENCE_PRODUCTION_ENDPOINT = 'https://www.wordfence.com/api/intelligence/v3/vulnerabilities/production';
@@ -24,9 +26,8 @@ main($argv);
 
 function main(array $argv): void
 {
-    loadLocalConfig();
-
     $options = parseOptions($argv);
+    loadConfigForOptions($options);
 
     $all = array_key_exists('all', $options);
     $pluginOption = trim((string) ($options['plugin'] ?? ''));
@@ -64,13 +65,19 @@ function main(array $argv): void
     $timeout = parsePositiveInt((string) ($options['timeout'] ?? '600'), 600);
     $cacheFile = (string) ($options['cache-file'] ?? defaultCacheFile($feed));
     $useCache = array_key_exists('use-cache', $options);
+    $softwareType = strtolower((string) ($options['software'] ?? 'plugin'));
+
+    if (!in_array($softwareType, ['plugin', 'core', 'theme', 'all'], true)) {
+        fwrite(STDERR, "Invalid --software value. Use plugin, core, theme, or all.\n");
+        exit(1);
+    }
 
     try {
         if (!$useCache) {
             downloadJsonToCache($endpoint, $apiKey, $timeout, $cacheFile);
         }
 
-        $result = processCachedFeed($cacheFile, $all, $plugin, $exact, $save, $table, $all ? 'ALL' : $pluginOption, $feed);
+        $result = processCachedFeed($cacheFile, $all, $plugin, $exact, $save, $table, $all ? 'ALL' : $pluginOption, $feed, $softwareType);
     } catch (RuntimeException $exception) {
         fwrite(STDERR, $exception->getMessage() . "\n");
         exit(1);
@@ -78,7 +85,8 @@ function main(array $argv): void
 
     $output = [
         'feed' => $feed,
-        'mode' => $all ? 'all_plugins' : 'plugin_filter',
+        'mode' => $all ? 'all_software' : 'plugin_filter',
+        'software' => $all ? $softwareType : 'plugin',
         'plugin_filter' => $all ? null : $pluginOption,
         'match_mode' => $all ? null : ($exact ? 'exact slug/name' : 'contains slug/name'),
         'count' => $result['matched_records'],
@@ -102,7 +110,9 @@ Usage:
 
 Options:
   --plugin=VALUE    Plugin slug or name to match.
-  --all             Save all plugin vulnerabilities from the feed.
+  --all             Save all matching software vulnerabilities from the feed.
+  --software=VALUE  Optional with --all. plugin, core, theme, or all. Default: plugin.
+  --site=PATH       Optional. Load wp-config.php from this WordPress path first.
   --api-key=VALUE   Optional. Defaults to WORDFENCE_API_KEY from wp-config.php.
   --feed=VALUE      Optional. production or scanner. Default: production.
   --exact           Optional. Require exact slug/name match instead of contains match.
@@ -115,9 +125,41 @@ Options:
 TEXT;
 }
 
-function loadLocalConfig(): void
+function loadConfigForOptions(array $options): void
 {
-    $configPath = __DIR__ . '/wp-config.php';
+    foreach (configPathsForOptions($options) as $configPath) {
+        loadConfigFile($configPath);
+    }
+}
+
+function configPathsForOptions(array $options): array
+{
+    $paths = [];
+    $sitePath = isset($options['site']) ? rtrim((string) $options['site'], DIRECTORY_SEPARATOR) : '';
+    if ($sitePath !== '') {
+        foreach (possibleWpConfigPaths($sitePath) as $path) {
+            $paths[] = $path;
+        }
+    }
+
+    $paths[] = __DIR__ . '/wp-config.php';
+
+    return array_values(array_unique($paths));
+}
+
+function possibleWpConfigPaths(string $sitePath): array
+{
+    return [
+        $sitePath . '/wp-config.php',
+        $sitePath . '/public/wp-config.php',
+        $sitePath . '/public_html/wp-config.php',
+        $sitePath . '/htdocs/wp-config.php',
+        dirname($sitePath) . '/wp-config.php',
+    ];
+}
+
+function loadConfigFile(string $configPath): void
+{
     if (!is_file($configPath)) {
         return;
     }
@@ -230,7 +272,8 @@ function processCachedFeed(
     bool $save,
     string $table,
     string $pluginFilter,
-    string $feed
+    string $feed,
+    string $softwareType
 ): array
 {
     if (!is_file($cacheFile)) {
@@ -256,7 +299,7 @@ function processCachedFeed(
         }
 
         $softwareMatches = $all
-            ? matchingPluginSoftware($record['software'])
+            ? matchingSoftwareByType($record['software'], $softwareType)
             : matchingFilteredPluginSoftware($record['software'], $plugin, $exact);
 
         if ($softwareMatches === []) {
@@ -472,12 +515,16 @@ function readJsonValue($handle): string
     throw new RuntimeException('Unexpected end of JSON while reading value.');
 }
 
-function matchingPluginSoftware(array $softwareItems): array
+function matchingSoftwareByType(array $softwareItems, string $softwareType): array
 {
     $matches = [];
 
     foreach ($softwareItems as $software) {
-        if (is_array($software) && ($software['type'] ?? null) === 'plugin') {
+        if (!is_array($software)) {
+            continue;
+        }
+
+        if ($softwareType === 'all' || ($software['type'] ?? null) === $softwareType) {
             $matches[] = $software;
         }
     }
