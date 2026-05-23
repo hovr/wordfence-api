@@ -38,8 +38,9 @@ function main(array $argv): void
         exit(1);
     }
 
+    $useCache = array_key_exists('use-cache', $options);
     $apiKey = trim((string) ($options['api-key'] ?? getConfiguredValue('WORDFENCE_API_KEY')));
-    if ($apiKey === '') {
+    if (!$useCache && $apiKey === '') {
         fwrite(STDERR, "Missing API key. Define WORDFENCE_API_KEY in wp-config.php or pass --api-key.\n\n");
         printUsage();
         exit(1);
@@ -64,7 +65,6 @@ function main(array $argv): void
     $table = (string) ($options['table'] ?? DEFAULT_RESULTS_TABLE);
     $timeout = parsePositiveInt((string) ($options['timeout'] ?? '600'), 600);
     $cacheFile = (string) ($options['cache-file'] ?? defaultCacheFile($feed));
-    $useCache = array_key_exists('use-cache', $options);
     $softwareType = strtolower((string) ($options['software'] ?? 'plugin'));
 
     if (!in_array($softwareType, ['plugin', 'core', 'theme', 'all'], true)) {
