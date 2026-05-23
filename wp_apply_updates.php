@@ -215,17 +215,24 @@ function plannedAssetUpdate(array $asset, string $mode): ?array
         return null;
     }
 
-    $target = null;
-    $reason = null;
+    $candidates = [];
     if (($mode === 'normal' || $mode === 'all') && !empty($asset['allowed_update_version'])) {
-        $target = (string) $asset['allowed_update_version'];
-        $reason = 'normal';
+        $candidates[] = [
+            'target' => (string) $asset['allowed_update_version'],
+            'reason' => 'normal',
+        ];
     }
 
     if (($mode === 'emergency' || $mode === 'all') && !empty($asset['current_is_vulnerable']) && !empty($asset['emergency_update_version'])) {
-        $target = (string) $asset['emergency_update_version'];
-        $reason = 'emergency';
+        $candidates[] = [
+            'target' => (string) $asset['emergency_update_version'],
+            'reason' => 'emergency',
+        ];
     }
+
+    $selected = newestUpdateCandidate($candidates);
+    $target = $selected['target'] ?? null;
+    $reason = $selected['reason'] ?? null;
 
     if ($target === null || compareVersions($target, (string) ($asset['current_version'] ?? '')) <= 0) {
         return null;
@@ -242,6 +249,23 @@ function plannedAssetUpdate(array $asset, string $mode): ?array
         'stdout' => null,
         'stderr' => null,
     ];
+}
+
+function newestUpdateCandidate(array $candidates): ?array
+{
+    $selected = null;
+
+    foreach ($candidates as $candidate) {
+        if (!is_array($candidate) || empty($candidate['target'])) {
+            continue;
+        }
+
+        if ($selected === null || compareVersions((string) $candidate['target'], (string) $selected['target']) > 0) {
+            $selected = $candidate;
+        }
+    }
+
+    return $selected;
 }
 
 function passesPluginFilters(array $plugin, array $filters): bool
