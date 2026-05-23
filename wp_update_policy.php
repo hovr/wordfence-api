@@ -57,6 +57,7 @@ function main(array $argv): void
 
         $db = createDatabase();
         createPolicyTables($db, $assetsTable, $versionsTable);
+        ensureWordfenceVulnerabilityTableCompatible($db, $vulnTable);
 
         $inventory = collectWordPressInventory($wpBinary, $sitePath);
         recordObservedAssets($db, $assetsTable, $versionsTable, $siteKey, $inventory);

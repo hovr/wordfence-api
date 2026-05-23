@@ -152,6 +152,94 @@ function ensureDirectory(string $directory): void
     }
 }
 
+
+
+function ensureWordfenceVulnerabilityTableCompatible(DB $db, string $table): void
+{
+    validateTableName($table);
+
+    if (!tableExists($db, $table)) {
+        throw new RuntimeException("Wordfence vulnerability table does not exist: {$table}. Run with --refresh-wordfence first.");
+    }
+
+    if (!tableColumnExists($db, $table, 'software_type')) {
+        $db->execute("ALTER TABLE `{$table}` ADD COLUMN `software_type` varchar(20) NULL DEFAULT NULL AFTER `vulnerability_id`");
+    }
+
+    backfillWordfenceSoftwareType($db, $table);
+
+    $primaryKeyColumns = primaryKeyColumns($db, $table);
+    if ($primaryKeyColumns !== ['vulnerability_id', 'software_type', 'software_slug']) {
+        $db->execute("ALTER TABLE `{$table}` DROP PRIMARY KEY, ADD PRIMARY KEY (`vulnerability_id`, `software_type`, `software_slug`)");
+    }
+
+    if (!indexExists($db, $table, 'idx_software_type_slug')) {
+        $db->execute("ALTER TABLE `{$table}` ADD KEY `idx_software_type_slug` (`software_type`, `software_slug`)");
+    }
+}
+
+function backfillWordfenceSoftwareType(DB $db, string $table): void
+{
+    $db->execute("
+        UPDATE `{$table}`
+        SET `software_type` = CASE
+            WHEN JSON_UNQUOTE(JSON_EXTRACT(`software_json`, '$.type')) IN ('plugin', 'core', 'theme')
+                THEN JSON_UNQUOTE(JSON_EXTRACT(`software_json`, '$.type'))
+            ELSE 'plugin'
+        END
+        WHERE `software_type` IS NULL
+           OR `software_type` = ''
+           OR JSON_UNQUOTE(JSON_EXTRACT(`software_json`, '$.type')) IN ('core', 'theme')
+    ");
+
+    $db->execute("ALTER TABLE `{$table}` MODIFY COLUMN `software_type` varchar(20) NOT NULL DEFAULT 'plugin'");
+}
+
+function tableExists(DB $db, string $table): bool
+{
+    $result = $db->query("
+        SELECT COUNT(*) AS `count`
+        FROM INFORMATION_SCHEMA.TABLES
+        WHERE TABLE_SCHEMA = DATABASE()
+          AND TABLE_NAME = " . sqlString($db, $table) . "
+    ");
+    $row = mysqli_fetch_assoc($result);
+
+    return isset($row['count']) && (int) $row['count'] > 0;
+}
+
+function tableColumnExists(DB $db, string $table, string $column): bool
+{
+    $result = $db->query("
+        SELECT COUNT(*) AS `count`
+        FROM INFORMATION_SCHEMA.COLUMNS
+        WHERE TABLE_SCHEMA = DATABASE()
+          AND TABLE_NAME = " . sqlString($db, $table) . "
+          AND COLUMN_NAME = " . sqlString($db, $column) . "
+    ");
+    $row = mysqli_fetch_assoc($result);
+
+    return isset($row['count']) && (int) $row['count'] > 0;
+}
+
+function primaryKeyColumns(DB $db, string $table): array
+{
+    $result = $db->query("SHOW KEYS FROM `{$table}` WHERE Key_name = 'PRIMARY' ORDER BY Seq_in_index ASC");
+    $columns = [];
+    while ($row = mysqli_fetch_assoc($result)) {
+        $columns[] = (string) $row['Column_name'];
+    }
+
+    return $columns;
+}
+
+function indexExists(DB $db, string $table, string $index): bool
+{
+    $result = $db->query("SHOW KEYS FROM `{$table}` WHERE Key_name = " . sqlString($db, $index));
+
+    return mysqli_fetch_assoc($result) !== null;
+}
+
 function sqlString(DB $db, string $value): string
 {
     return "'" . $db->escapeString($value) . "'";
