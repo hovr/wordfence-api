@@ -291,7 +291,13 @@ function applyUpdate(string $wpBinary, string $sitePath, array &$update): void
         return;
     }
 
-    verifyLiveVersionBeforeUpdate($wpBinary, $sitePath, $update);
+    try {
+        verifyLiveVersionBeforeUpdate($wpBinary, $sitePath, $update);
+    } catch (RuntimeException $exception) {
+        $update['status'] = 'failed';
+        $update['stderr'] = $exception->getMessage();
+        throw $exception;
+    }
 
     if ($update['status'] === 'skipped') {
         return;
