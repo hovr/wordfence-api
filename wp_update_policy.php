@@ -38,6 +38,7 @@ function main(array $argv): void
     $siteKey = (string) ($options['site-key'] ?? basename($sitePath));
     $normalDays = parsePositiveInt((string) ($options['normal-days'] ?? '7'), 7);
     $emergencyDays = parsePositiveInt((string) ($options['emergency-days'] ?? '2'), 2);
+    $allowRoot = array_key_exists('allow-root', $options);
     $vulnTable = (string) ($options['vuln-table'] ?? DEFAULT_VULN_TABLE);
     $assetsTable = (string) ($options['assets-table'] ?? DEFAULT_ASSETS_TABLE);
     $versionsTable = (string) ($options['versions-table'] ?? DEFAULT_VERSIONS_TABLE);
@@ -59,7 +60,7 @@ function main(array $argv): void
         createPolicyTables($db, $assetsTable, $versionsTable);
         ensureWordfenceVulnerabilityTableCompatible($db, $vulnTable);
 
-        $inventory = collectWordPressInventory($wpBinary, $sitePath);
+        $inventory = collectWordPressInventory($wpBinary, $sitePath, $allowRoot);
         recordObservedAssets($db, $assetsTable, $versionsTable, $siteKey, $inventory);
 
         $policy = buildPolicy(
@@ -102,6 +103,7 @@ Options:
   --config=PATH          Optional private config file to parse before wp-config.php.
   --site-key=VALUE       Optional stable site id. Default: basename of --site.
   --wp=PATH              Optional WP-CLI binary. Default: wp.
+  --allow-root           Optional. Pass --allow-root to WP-CLI.
   --normal-days=N        Optional normal update delay. Default: 7.
   --emergency-days=N     Optional emergency update delay. Default: 2.
   --output=PATH          Optional policy JSON output path.
@@ -163,21 +165,21 @@ function refreshWordfence(array $options, string $sitePath, string $vulnTable): 
     ];
 }
 
-function collectWordPressInventory(string $wpBinary, string $sitePath): array
+function collectWordPressInventory(string $wpBinary, string $sitePath, bool $allowRoot): array
 {
     $plugins = runWpJson($wpBinary, $sitePath, [
         'plugin',
         'list',
         '--fields=name,title,status,version,update,update_version',
         '--format=json',
-    ]);
+    ], false, $allowRoot);
 
-    $coreVersion = trim(runWp($wpBinary, $sitePath, ['core', 'version']));
+    $coreVersion = trim(runWp($wpBinary, $sitePath, ['core', 'version'], false, $allowRoot));
     if ($coreVersion === '') {
         throw new RuntimeException('Unable to read WordPress core version.');
     }
 
-    $coreUpdates = runWpJson($wpBinary, $sitePath, ['core', 'check-update', '--format=json'], true);
+    $coreUpdates = runWpJson($wpBinary, $sitePath, ['core', 'check-update', '--format=json'], true, $allowRoot);
 
     return [
         'core' => [
@@ -190,9 +192,9 @@ function collectWordPressInventory(string $wpBinary, string $sitePath): array
     ];
 }
 
-function runWpJson(string $wpBinary, string $sitePath, array $args, bool $allowNoUpdates = false): array
+function runWpJson(string $wpBinary, string $sitePath, array $args, bool $allowNoUpdates = false, bool $allowRoot = false): array
 {
-    $output = runWp($wpBinary, $sitePath, $args, $allowNoUpdates);
+    $output = runWp($wpBinary, $sitePath, $args, $allowNoUpdates, $allowRoot);
     $output = trim($output);
     if ($output === '') {
         return [];
@@ -210,9 +212,12 @@ function runWpJson(string $wpBinary, string $sitePath, array $args, bool $allowN
     return $decoded;
 }
 
-function runWp(string $wpBinary, string $sitePath, array $args, bool $allowNoUpdates = false): string
+function runWp(string $wpBinary, string $sitePath, array $args, bool $allowNoUpdates = false, bool $allowRoot = false): string
 {
     $command = array_merge([$wpBinary, '--path=' . $sitePath], $args);
+    if ($allowRoot) {
+        $command[] = '--allow-root';
+    }
     $stdout = runCommand($command, $stderr, $status, false, 'wp-policy-stderr-');
 
     if ($status !== 0) {

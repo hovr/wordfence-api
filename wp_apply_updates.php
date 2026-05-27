@@ -31,7 +31,10 @@ function main(array $argv): void
             throw new RuntimeException('Missing or invalid site path. Pass --site or regenerate the policy with a valid site_path.');
         }
 
-        loadConfigForOptions(['site' => $sitePath]);
+        loadConfigForOptions([
+            'site' => $sitePath,
+            'config' => $options['config'] ?? null,
+        ]);
     } catch (RuntimeException $exception) {
         fwrite(STDERR, $exception->getMessage() . "\n\n");
         printUsage();
@@ -40,6 +43,7 @@ function main(array $argv): void
 
     $siteKey = (string) ($options['site-key'] ?? $policy['site_key'] ?? basename($sitePath));
     $wpBinary = (string) ($options['wp'] ?? 'wp');
+    $allowRoot = array_key_exists('allow-root', $options);
     $mode = strtolower((string) ($options['mode'] ?? 'all'));
     if (!in_array($mode, ['normal', 'emergency', 'all'], true)) {
         fwrite(STDERR, "Invalid --mode. Use normal, emergency, or all.\n");
@@ -84,17 +88,17 @@ function main(array $argv): void
 
         if ($apply && $updates !== []) {
             if ($backupDb) {
-                $summary['backup'] = backupDatabase($wpBinary, $sitePath, $siteKey, (string) ($options['backup-dir'] ?? __DIR__ . '/backups'));
+                $summary['backup'] = backupDatabase($wpBinary, $sitePath, $siteKey, (string) ($options['backup-dir'] ?? __DIR__ . '/backups'), $allowRoot);
             }
 
             if ($maintenance) {
-                runWp($wpBinary, $sitePath, ['maintenance-mode', 'activate']);
+                runWp($wpBinary, $sitePath, ['maintenance-mode', 'activate'], false, $allowRoot);
                 $maintenanceActive = true;
                 $summary['maintenance'] = true;
             }
 
             foreach ($summary['updates'] as &$update) {
-                applyUpdate($wpBinary, $sitePath, $update);
+                applyUpdate($wpBinary, $sitePath, $update, $allowRoot);
             }
             unset($update);
         }
@@ -103,7 +107,7 @@ function main(array $argv): void
         fwrite(STDERR, $exception->getMessage() . "\n");
     } finally {
         if ($maintenanceActive) {
-            runWp($wpBinary, $sitePath, ['maintenance-mode', 'deactivate'], true);
+            runWp($wpBinary, $sitePath, ['maintenance-mode', 'deactivate'], true, $allowRoot);
         }
 
         if (is_resource($lockHandle)) {
@@ -127,6 +131,7 @@ Options:
   --apply             Actually run updates. Omit for dry-run.
   --mode=VALUE        normal, emergency, or all. Default: all.
   --wp=PATH           Optional WP-CLI binary. Default: wp.
+  --allow-root        Optional. Pass --allow-root to WP-CLI.
   --site=PATH         Optional override for policy site_path.
   --config=PATH       Optional private config file to parse before wp-config.php.
   --site-key=VALUE    Optional override for policy site_key.
@@ -280,7 +285,7 @@ function passesPluginFilters(array $plugin, array $filters): bool
     return !in_array($slug, $filters['exclude'], true);
 }
 
-function applyUpdate(string $wpBinary, string $sitePath, array &$update): void
+function applyUpdate(string $wpBinary, string $sitePath, array &$update, bool $allowRoot): void
 {
     if ($update['type'] === 'core') {
         $args = ['core', 'update', '--version=' . $update['to_version']];
@@ -293,7 +298,7 @@ function applyUpdate(string $wpBinary, string $sitePath, array &$update): void
     }
 
     try {
-        verifyLiveVersionBeforeUpdate($wpBinary, $sitePath, $update);
+        verifyLiveVersionBeforeUpdate($wpBinary, $sitePath, $update, $allowRoot);
     } catch (RuntimeException $exception) {
         $update['status'] = 'failed';
         $update['stderr'] = $exception->getMessage();
@@ -304,7 +309,7 @@ function applyUpdate(string $wpBinary, string $sitePath, array &$update): void
         return;
     }
 
-    $stdout = runWp($wpBinary, $sitePath, $args, true, $stderr, $status);
+    $stdout = runWp($wpBinary, $sitePath, $args, true, $allowRoot, $stderr, $status);
     $update['stdout'] = trim($stdout);
     $update['stderr'] = trim((string) $stderr);
     $update['status'] = $status === 0 ? 'updated' : 'failed';
@@ -314,9 +319,9 @@ function applyUpdate(string $wpBinary, string $sitePath, array &$update): void
     }
 }
 
-function verifyLiveVersionBeforeUpdate(string $wpBinary, string $sitePath, array &$update): void
+function verifyLiveVersionBeforeUpdate(string $wpBinary, string $sitePath, array &$update, bool $allowRoot): void
 {
-    $liveVersion = liveAssetVersion($wpBinary, $sitePath, (string) $update['type'], (string) $update['slug']);
+    $liveVersion = liveAssetVersion($wpBinary, $sitePath, (string) $update['type'], (string) $update['slug'], $allowRoot);
     $update['live_version'] = $liveVersion;
 
     if (compareVersions($liveVersion, (string) $update['to_version']) >= 0) {
@@ -334,14 +339,14 @@ function verifyLiveVersionBeforeUpdate(string $wpBinary, string $sitePath, array
     }
 }
 
-function liveAssetVersion(string $wpBinary, string $sitePath, string $type, string $slug): string
+function liveAssetVersion(string $wpBinary, string $sitePath, string $type, string $slug, bool $allowRoot): string
 {
     if ($type === 'core') {
-        return trim(runWp($wpBinary, $sitePath, ['core', 'version']));
+        return trim(runWp($wpBinary, $sitePath, ['core', 'version'], false, $allowRoot));
     }
 
     if ($type === 'plugin') {
-        return trim(runWp($wpBinary, $sitePath, ['plugin', 'get', $slug, '--field=version']));
+        return trim(runWp($wpBinary, $sitePath, ['plugin', 'get', $slug, '--field=version'], false, $allowRoot));
     }
 
     throw new RuntimeException("Unsupported update type: {$type}");
@@ -355,14 +360,14 @@ function updateLabel(array $update): string
     return $slug === '' ? $type : "{$type} {$slug}";
 }
 
-function backupDatabase(string $wpBinary, string $sitePath, string $siteKey, string $backupDir): array
+function backupDatabase(string $wpBinary, string $sitePath, string $siteKey, string $backupDir, bool $allowRoot): array
 {
     ensureDirectory($backupDir);
     $backupPath = rtrim($backupDir, DIRECTORY_SEPARATOR)
         . DIRECTORY_SEPARATOR
         . safeFileName($siteKey) . '-' . gmdate('Ymd-His') . '.sql';
 
-    $stdout = runWp($wpBinary, $sitePath, ['db', 'export', $backupPath], false, $stderr, $status);
+    $stdout = runWp($wpBinary, $sitePath, ['db', 'export', $backupPath], false, $allowRoot, $stderr, $status);
     if ($status !== 0) {
         throw new RuntimeException('Database backup failed: ' . trim($stderr));
     }
@@ -491,9 +496,12 @@ function releaseLock($handle): void
     fclose($handle);
 }
 
-function runWp(string $wpBinary, string $sitePath, array $args, bool $allowFailure = false, ?string &$stderr = null, ?int &$status = null): string
+function runWp(string $wpBinary, string $sitePath, array $args, bool $allowFailure = false, bool $allowRoot = false, ?string &$stderr = null, ?int &$status = null): string
 {
     $command = array_merge([$wpBinary, '--path=' . $sitePath], $args);
+    if ($allowRoot) {
+        $command[] = '--allow-root';
+    }
     $stdout = runCommand($command, $stderr, $status, false, 'wp-apply-stderr-');
 
     if ($status !== 0 && !$allowFailure) {
