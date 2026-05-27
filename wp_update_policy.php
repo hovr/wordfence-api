@@ -35,6 +35,7 @@ function main(array $argv): void
     requireDbClass();
 
     $wpBinary = (string) ($options['wp'] ?? 'wp');
+    $wpUser = optionalWpUser($options);
     $siteKey = (string) ($options['site-key'] ?? basename($sitePath));
     $normalDays = parsePositiveInt((string) ($options['normal-days'] ?? '7'), 7);
     $emergencyDays = parsePositiveInt((string) ($options['emergency-days'] ?? '2'), 2);
@@ -59,7 +60,7 @@ function main(array $argv): void
         createPolicyTables($db, $assetsTable, $versionsTable);
         ensureWordfenceVulnerabilityTableCompatible($db, $vulnTable);
 
-        $inventory = collectWordPressInventory($wpBinary, $sitePath);
+        $inventory = collectWordPressInventory($wpBinary, $sitePath, $wpUser);
         recordObservedAssets($db, $assetsTable, $versionsTable, $siteKey, $inventory);
 
         $policy = buildPolicy(
@@ -102,6 +103,7 @@ Options:
   --config=PATH          Optional private config file to parse before wp-config.php.
   --site-key=VALUE       Optional stable site id. Default: basename of --site.
   --wp=PATH              Optional WP-CLI binary. Default: wp.
+  --wp-user=USER         Optional. Run WP-CLI via sudo -u USER.
   --normal-days=N        Optional normal update delay. Default: 7.
   --emergency-days=N     Optional emergency update delay. Default: 2.
   --output=PATH          Optional policy JSON output path.
@@ -163,21 +165,21 @@ function refreshWordfence(array $options, string $sitePath, string $vulnTable): 
     ];
 }
 
-function collectWordPressInventory(string $wpBinary, string $sitePath): array
+function collectWordPressInventory(string $wpBinary, string $sitePath, ?string $wpUser): array
 {
     $plugins = runWpJson($wpBinary, $sitePath, [
         'plugin',
         'list',
         '--fields=name,title,status,version,update,update_version',
         '--format=json',
-    ]);
+    ], false, $wpUser);
 
-    $coreVersion = trim(runWp($wpBinary, $sitePath, ['core', 'version']));
+    $coreVersion = trim(runWp($wpBinary, $sitePath, ['core', 'version'], false, $wpUser));
     if ($coreVersion === '') {
         throw new RuntimeException('Unable to read WordPress core version.');
     }
 
-    $coreUpdates = runWpJson($wpBinary, $sitePath, ['core', 'check-update', '--format=json'], true);
+    $coreUpdates = runWpJson($wpBinary, $sitePath, ['core', 'check-update', '--format=json'], true, $wpUser);
 
     return [
         'core' => [
@@ -190,9 +192,9 @@ function collectWordPressInventory(string $wpBinary, string $sitePath): array
     ];
 }
 
-function runWpJson(string $wpBinary, string $sitePath, array $args, bool $allowNoUpdates = false): array
+function runWpJson(string $wpBinary, string $sitePath, array $args, bool $allowNoUpdates = false, ?string $wpUser = null): array
 {
-    $output = runWp($wpBinary, $sitePath, $args, $allowNoUpdates);
+    $output = runWp($wpBinary, $sitePath, $args, $allowNoUpdates, $wpUser);
     $output = trim($output);
     if ($output === '') {
         return [];
@@ -210,9 +212,9 @@ function runWpJson(string $wpBinary, string $sitePath, array $args, bool $allowN
     return $decoded;
 }
 
-function runWp(string $wpBinary, string $sitePath, array $args, bool $allowNoUpdates = false): string
+function runWp(string $wpBinary, string $sitePath, array $args, bool $allowNoUpdates = false, ?string $wpUser = null): string
 {
-    $command = array_merge([$wpBinary, '--path=' . $sitePath], $args);
+    $command = wpCliCommand($wpBinary, $sitePath, $args, $wpUser);
     $stdout = runCommand($command, $stderr, $status, false, 'wp-policy-stderr-');
 
     if ($status !== 0) {
@@ -225,6 +227,30 @@ function runWp(string $wpBinary, string $sitePath, array $args, bool $allowNoUpd
     }
 
     return $stdout;
+}
+
+function wpCliCommand(string $wpBinary, string $sitePath, array $args, ?string $wpUser): array
+{
+    $command = [$wpBinary, '--path=' . $sitePath];
+    if ($wpUser !== null) {
+        $command = ['sudo', '-u', $wpUser, '--', $wpBinary, '--path=' . $sitePath];
+    }
+
+    return array_merge($command, $args);
+}
+
+function optionalWpUser(array $options): ?string
+{
+    if (empty($options['wp-user'])) {
+        return null;
+    }
+
+    $user = (string) $options['wp-user'];
+    if (!preg_match('/^[A-Za-z0-9._-]+$/', $user)) {
+        throw new RuntimeException('Invalid --wp-user value.');
+    }
+
+    return $user;
 }
 
 function isWpNoUpdatesOutput(string $output): bool
