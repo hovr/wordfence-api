@@ -258,10 +258,17 @@ function tableColumnExists(DB $db, string $table, string $column): bool
 
 function primaryKeyColumns(DB $db, string $table): array
 {
-    $result = $db->query("SHOW KEYS FROM `{$table}` WHERE Key_name = 'PRIMARY' ORDER BY Seq_in_index ASC");
+    $result = $db->query("
+        SELECT COLUMN_NAME
+        FROM INFORMATION_SCHEMA.STATISTICS
+        WHERE TABLE_SCHEMA = DATABASE()
+          AND TABLE_NAME = " . sqlString($db, $table) . "
+          AND INDEX_NAME = 'PRIMARY'
+        ORDER BY SEQ_IN_INDEX ASC
+    ");
     $columns = [];
     while ($row = mysqli_fetch_assoc($result)) {
-        $columns[] = (string) $row['Column_name'];
+        $columns[] = (string) $row['COLUMN_NAME'];
     }
 
     return $columns;
@@ -269,9 +276,16 @@ function primaryKeyColumns(DB $db, string $table): array
 
 function indexExists(DB $db, string $table, string $index): bool
 {
-    $result = $db->query("SHOW KEYS FROM `{$table}` WHERE Key_name = " . sqlString($db, $index));
+    $result = $db->query("
+        SELECT COUNT(*) AS `count`
+        FROM INFORMATION_SCHEMA.STATISTICS
+        WHERE TABLE_SCHEMA = DATABASE()
+          AND TABLE_NAME = " . sqlString($db, $table) . "
+          AND INDEX_NAME = " . sqlString($db, $index) . "
+    ");
+    $row = mysqli_fetch_assoc($result);
 
-    return mysqli_fetch_assoc($result) !== null;
+    return isset($row['count']) && (int) $row['count'] > 0;
 }
 
 function sqlString(DB $db, string $value): string
