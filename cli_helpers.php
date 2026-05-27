@@ -33,6 +33,10 @@ function loadConfigForOptions(array $options): void
 function configPathsForOptions(array $options): array
 {
     $paths = [];
+    if (!empty($options['config'])) {
+        $paths[] = (string) $options['config'];
+    }
+
     $sitePath = isset($options['site']) ? rtrim((string) $options['site'], DIRECTORY_SEPARATOR) : '';
     if ($sitePath !== '') {
         foreach (possibleWpConfigPaths($sitePath) as $path) {

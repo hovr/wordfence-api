@@ -99,6 +99,7 @@ Usage:
 
 Options:
   --site=PATH            Required. WordPress install path.
+  --config=PATH          Optional private config file to parse before wp-config.php.
   --site-key=VALUE       Optional stable site id. Default: basename of --site.
   --wp=PATH              Optional WP-CLI binary. Default: wp.
   --normal-days=N        Optional normal update delay. Default: 7.
@@ -133,6 +134,10 @@ function refreshWordfence(array $options, string $sitePath, string $vulnTable): 
         '--feed=' . (string) ($options['wf-feed'] ?? 'production'),
         '--timeout=' . (string) ($options['wf-timeout'] ?? '600'),
     ];
+
+    if (isset($options['config'])) {
+        $args[] = '--config=' . (string) $options['config'];
+    }
 
     if (isset($options['wf-cache-file'])) {
         $args[] = '--cache-file=' . (string) $options['wf-cache-file'];

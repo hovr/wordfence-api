@@ -115,6 +115,7 @@ Options:
   --all             Save all matching software vulnerabilities from the feed.
   --software=VALUE  Optional with --all. plugin, core, theme, or all. Default: plugin.
   --site=PATH       Optional. Load wp-config.php from this WordPress path first.
+  --config=PATH     Optional private config file to parse before wp-config.php.
   --api-key=VALUE   Optional. Defaults to WORDFENCE_API_KEY from wp-config.php.
   --feed=VALUE      Optional. production or scanner. Default: production.
   --exact           Optional. Require exact slug/name match instead of contains match.

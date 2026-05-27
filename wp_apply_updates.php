@@ -128,6 +128,7 @@ Options:
   --mode=VALUE        normal, emergency, or all. Default: all.
   --wp=PATH           Optional WP-CLI binary. Default: wp.
   --site=PATH         Optional override for policy site_path.
+  --config=PATH       Optional private config file to parse before wp-config.php.
   --site-key=VALUE    Optional override for policy site_key.
   --backup-db         Export database before applying updates.
   --backup-dir=PATH   Optional backup directory. Default: ./backups.
