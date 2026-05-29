@@ -9,7 +9,7 @@ declare(strict_types=1);
  * Usage:
  *   php wp_update_policy.php --site=/path/to/wordpress
  *   php wp_update_policy.php --site=/path/to/wordpress --refresh-wordfence
- *   php wp_update_policy.php --site=/path/to/wordpress --wp=/usr/local/bin/wp --normal-days=7 --emergency-days=2
+ *   php wp_update_policy.php --site=/path/to/wordpress --wp=/usr/local/bin/wp --normal-hours=168 --emergency-hours=48
  */
 
 const DEFAULT_VULN_TABLE = 'wordfence_plugin_vulnerabilities';
@@ -37,8 +37,8 @@ function main(array $argv): void
     $wpBinary = (string) ($options['wp'] ?? 'wp');
     $wpUser = optionalWpUser($options);
     $siteKey = (string) ($options['site-key'] ?? basename($sitePath));
-    $normalDays = parsePositiveInt((string) ($options['normal-days'] ?? '7'), 7);
-    $emergencyDays = parsePositiveInt((string) ($options['emergency-days'] ?? '2'), 2);
+    $normalHours = delayHours($options, 'normal', 168);
+    $emergencyHours = delayHours($options, 'emergency', 48);
     $vulnTable = (string) ($options['vuln-table'] ?? DEFAULT_VULN_TABLE);
     $assetsTable = (string) ($options['assets-table'] ?? DEFAULT_ASSETS_TABLE);
     $versionsTable = (string) ($options['versions-table'] ?? DEFAULT_VERSIONS_TABLE);
@@ -71,11 +71,12 @@ function main(array $argv): void
             $siteKey,
             $sitePath,
             $inventory,
-            $normalDays,
-            $emergencyDays
+            $normalHours,
+            $emergencyHours
         );
 
         writeJsonFile($output, $policy);
+        $notification = notifyPolicy($policy, $output, $wordfenceRefresh, $options);
     } catch (RuntimeException $exception) {
         fwrite(STDERR, $exception->getMessage() . "\n");
         exit(1);
@@ -89,6 +90,7 @@ function main(array $argv): void
         'plugin_count' => count($policy['plugins']),
         'generated_at' => $policy['generated_at'],
         'wordfence_refresh' => $wordfenceRefresh,
+        'notification' => $notification,
     ], JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES) . PHP_EOL;
 }
 
@@ -104,9 +106,13 @@ Options:
   --site-key=VALUE       Optional stable site id. Default: basename of --site.
   --wp=PATH              Optional WP-CLI binary. Default: wp.
   --wp-user=USER         Optional. Run WP-CLI via sudo -u USER.
-  --normal-days=N        Optional normal update delay. Default: 7.
-  --emergency-days=N     Optional emergency update delay. Default: 2.
+  --normal-hours=N       Optional normal update delay. Default: 168.
+  --emergency-hours=N    Optional emergency update delay. Default: 48.
+  --normal-days=N        Backward-compatible alias. Converted to hours.
+  --emergency-days=N     Backward-compatible alias. Converted to hours.
   --output=PATH          Optional policy JSON output path.
+  --notify-email=ADDR    Optional. Email policy summary after generation.
+  --no-notify            Optional. Disable policy email notification.
   --refresh-wordfence    Optional. Refresh Wordfence vulnerability DB before building policy.
   --wf-feed=VALUE        Optional with --refresh-wordfence. production or scanner. Default: production.
   --wf-timeout=SECONDS   Optional with --refresh-wordfence. Default: 600.
@@ -253,6 +259,21 @@ function optionalWpUser(array $options): ?string
     return $user;
 }
 
+function delayHours(array $options, string $prefix, int $defaultHours): int
+{
+    $hoursKey = $prefix . '-hours';
+    if (isset($options[$hoursKey])) {
+        return parsePositiveInt((string) $options[$hoursKey], $defaultHours);
+    }
+
+    $daysKey = $prefix . '-days';
+    if (isset($options[$daysKey])) {
+        return parsePositiveInt((string) $options[$daysKey], (int) ceil($defaultHours / 24)) * 24;
+    }
+
+    return $defaultHours;
+}
+
 function isWpNoUpdatesOutput(string $output): bool
 {
     return preg_match('/\b(already|latest|up to date|no updates?)\b/i', $output) === 1;
@@ -332,8 +353,8 @@ function buildPolicy(
     string $siteKey,
     string $sitePath,
     array $inventory,
-    int $normalDays,
-    int $emergencyDays
+    int $normalHours,
+    int $emergencyHours
 ): array {
     $now = gmdate('Y-m-d H:i:s');
     $policy = [
@@ -341,10 +362,12 @@ function buildPolicy(
         'site_key' => $siteKey,
         'site_path' => $sitePath,
         'rules' => [
-            'normal_delay_days' => $normalDays,
-            'emergency_delay_days' => $emergencyDays,
+            'normal_delay_hours' => $normalHours,
+            'emergency_delay_hours' => $emergencyHours,
+            'normal_delay_days' => $normalHours / 24,
+            'emergency_delay_days' => $emergencyHours / 24,
         ],
-        'core' => buildAssetPolicy($db, $versionsTable, $vulnTable, $siteKey, 'core', 'wordpress', 'WordPress Core', $inventory['core']['version'], $normalDays, $emergencyDays),
+        'core' => buildAssetPolicy($db, $versionsTable, $vulnTable, $siteKey, 'core', 'wordpress', 'WordPress Core', $inventory['core']['version'], $normalHours, $emergencyHours),
         'plugins' => [],
     ];
 
@@ -358,8 +381,8 @@ function buildPolicy(
             $plugin['slug'],
             $plugin['name'],
             $plugin['version'],
-            $normalDays,
-            $emergencyDays,
+            $normalHours,
+            $emergencyHours,
             $plugin['status']
         );
     }
@@ -376,8 +399,8 @@ function buildAssetPolicy(
     string $slug,
     string $name,
     string $currentVersion,
-    int $normalDays,
-    int $emergencyDays,
+    int $normalHours,
+    int $emergencyHours,
     string $status = 'active'
 ): array {
     $observedVersions = getObservedVersions($db, $versionsTable, $siteKey, $assetType, $slug);
@@ -385,8 +408,8 @@ function buildAssetPolicy(
         ? loadVulnerabilitiesForAsset($db, $vulnTable, $assetType, $slug)
         : [];
     $currentVulns = findVulnerabilitiesForVersion($vulnerabilityRows, $currentVersion);
-    $normalCandidates = agedVersions($observedVersions, $currentVersion, $normalDays);
-    $emergencyCandidates = agedVersions($observedVersions, $currentVersion, $emergencyDays);
+    $normalCandidates = agedVersions($observedVersions, $currentVersion, $normalHours);
+    $emergencyCandidates = agedVersions($observedVersions, $currentVersion, $emergencyHours);
 
     $normalVersion = newestSafeVersion($vulnerabilityRows, $normalCandidates);
     $emergencyVersion = newestSafeVersion($vulnerabilityRows, $emergencyCandidates);
@@ -443,9 +466,9 @@ function getObservedVersions(DB $db, string $versionsTable, string $siteKey, str
     return $versions;
 }
 
-function agedVersions(array $observedVersions, string $currentVersion, int $days): array
+function agedVersions(array $observedVersions, string $currentVersion, int $hours): array
 {
-    $cutoff = time() - ($days * 86400);
+    $cutoff = time() - ($hours * 3600);
     $versions = [];
 
     foreach ($observedVersions as $observed) {
@@ -649,6 +672,165 @@ function writeJsonFile(string $path, array $data): void
         @unlink($tmpFile);
         throw new RuntimeException("Unable to move temporary policy file into place: {$path}");
     }
+}
+
+function notifyPolicy(array $policy, string $outputPath, ?array $wordfenceRefresh, array $options): array
+{
+    if (array_key_exists('no-notify', $options)) {
+        return ['sent' => false, 'reason' => 'disabled'];
+    }
+
+    $email = notificationEmail($options);
+    if ($email === '') {
+        return ['sent' => false, 'reason' => 'missing_email'];
+    }
+
+    $counts = policyActionCounts($policy);
+    $subject = '[WordPress Update Policy] ' . (string) ($policy['site_key'] ?? 'site')
+        . ' - ' . policySubjectSummary($counts);
+    $body = policyEmailBody($policy, $outputPath, $wordfenceRefresh, $counts);
+    $headers = 'From: WordPress Update Policy <wordpress-updates@localhost>';
+    $sent = mail($email, $subject, $body, $headers);
+
+    return [
+        'sent' => $sent,
+        'to' => $email,
+        'reason' => $sent ? null : 'mail_failed',
+        'counts' => $counts,
+    ];
+}
+
+function policyActionCounts(array $policy): array
+{
+    $counts = [
+        'normal_update' => 0,
+        'emergency_update' => 0,
+        'manual_review' => 0,
+        'hold' => 0,
+    ];
+
+    foreach (policyAssets($policy) as $asset) {
+        $action = (string) ($asset['recommended_action'] ?? 'hold');
+        if (!array_key_exists($action, $counts)) {
+            $counts[$action] = 0;
+        }
+
+        $counts[$action]++;
+    }
+
+    return $counts;
+}
+
+function policyAssets(array $policy): array
+{
+    $assets = [];
+    if (isset($policy['core']) && is_array($policy['core'])) {
+        $assets[] = $policy['core'];
+    }
+
+    foreach (($policy['plugins'] ?? []) as $plugin) {
+        if (is_array($plugin)) {
+            $assets[] = $plugin;
+        }
+    }
+
+    return $assets;
+}
+
+function policySubjectSummary(array $counts): string
+{
+    if (($counts['manual_review'] ?? 0) > 0) {
+        return $counts['manual_review'] . ' manual review';
+    }
+
+    if (($counts['emergency_update'] ?? 0) > 0) {
+        return $counts['emergency_update'] . ' emergency update';
+    }
+
+    if (($counts['normal_update'] ?? 0) > 0) {
+        return $counts['normal_update'] . ' normal update';
+    }
+
+    return 'no updates';
+}
+
+function policyEmailBody(array $policy, string $outputPath, ?array $wordfenceRefresh, array $counts): string
+{
+    $rules = is_array($policy['rules'] ?? null) ? $policy['rules'] : [];
+    $lines = [
+        'WordPress update policy generated.',
+        '',
+        'Site: ' . (string) ($policy['site_key'] ?? ''),
+        'Path: ' . (string) ($policy['site_path'] ?? ''),
+        'Policy file: ' . $outputPath,
+        'Generated: ' . (string) ($policy['generated_at'] ?? ''),
+        '',
+        'Rules:',
+        '  Normal delay: ' . (string) ($rules['normal_delay_hours'] ?? '') . ' hours',
+        '  Emergency delay: ' . (string) ($rules['emergency_delay_hours'] ?? '') . ' hours',
+        '',
+        'Recommended actions:',
+        '  Normal updates: ' . (string) ($counts['normal_update'] ?? 0),
+        '  Emergency updates: ' . (string) ($counts['emergency_update'] ?? 0),
+        '  Manual review: ' . (string) ($counts['manual_review'] ?? 0),
+        '  Hold: ' . (string) ($counts['hold'] ?? 0),
+        '',
+    ];
+
+    if ($wordfenceRefresh !== null) {
+        $lines[] = 'Wordfence refresh:';
+        $lines[] = '  Feed: ' . (string) ($wordfenceRefresh['feed'] ?? '');
+        $lines[] = '  Software: ' . (string) ($wordfenceRefresh['software'] ?? '');
+        $lines[] = '  Saved rows: ' . (string) ($wordfenceRefresh['saved_rows'] ?? '');
+        $lines[] = '  Cache file: ' . (string) ($wordfenceRefresh['cache_file'] ?? '');
+        $lines[] = '';
+    }
+
+    $notable = array_filter(policyAssets($policy), static function (array $asset): bool {
+        return in_array((string) ($asset['recommended_action'] ?? 'hold'), ['manual_review', 'emergency_update', 'normal_update'], true);
+    });
+
+    if ($notable !== []) {
+        $lines[] = 'Assets requiring action:';
+        foreach ($notable as $asset) {
+            $lines[] = '  - ' . strtoupper((string) ($asset['type'] ?? 'asset'))
+                . ' ' . (string) ($asset['slug'] ?? '')
+                . ' ' . (string) ($asset['current_version'] ?? '')
+                . ' => ' . (string) ($asset['recommended_action'] ?? 'hold')
+                . targetVersionSummary($asset);
+        }
+        $lines[] = '';
+    }
+
+    return implode("\n", $lines);
+}
+
+function targetVersionSummary(array $asset): string
+{
+    $action = (string) ($asset['recommended_action'] ?? 'hold');
+    if ($action === 'emergency_update' && !empty($asset['emergency_update_version'])) {
+        return ' to ' . (string) $asset['emergency_update_version'];
+    }
+
+    if ($action === 'normal_update' && !empty($asset['allowed_update_version'])) {
+        return ' to ' . (string) $asset['allowed_update_version'];
+    }
+
+    return '';
+}
+
+function notificationEmail(array $options): string
+{
+    if (!empty($options['notify-email'])) {
+        return (string) $options['notify-email'];
+    }
+
+    $email = getConfiguredValue('UPDATE_NOTIFY_EMAIL');
+    if ($email !== '') {
+        return $email;
+    }
+
+    return getConfiguredValue('ADMIN_EMAIL');
 }
 
 function compareVersions(string $a, string $b): int
