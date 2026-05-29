@@ -36,25 +36,57 @@ function main(array $argv): void
     $localTable = (string) ($options['local-table'] ?? DEFAULT_VULN_TABLE);
     $remoteTable = (string) ($options['remote-table'] ?? getConfiguredValue('WORDFENCE_REMOTE_DB_TABLE') ?: DEFAULT_VULN_TABLE);
     $batchSize = parsePositiveInt((string) ($options['batch-size'] ?? '1000'), 1000);
+    $stagingTable = stagingTableName($localTable);
+    $backupTable = backupTableName($localTable);
 
     validateTableName($localTable);
     validateTableName($remoteTable);
+    validateTableName($stagingTable);
+    validateTableName($backupTable);
+
+    $remoteLink = null;
+    $localDb = null;
+    $lockName = null;
 
     try {
         $localDb = createDatabase();
-        createLocalWordfenceTable($localDb, $localTable);
+        $lockName = acquireWordfenceVulnerabilityLock($localDb, $localTable);
+        createWordfenceVulnerabilityTable($localDb, $localTable);
+        prepareStagingTable($localDb, $stagingTable, $backupTable);
 
         $remote = remoteConnectionSettings($options);
         $remoteLink = mysqli_connect($remote['host'], $remote['user'], $remote['password'], $remote['database']);
         if (!$remoteLink) {
             throw new RuntimeException('Unable to connect to remote Wordfence database: ' . mysqli_connect_error());
         }
+        if (!mysqli_set_charset($remoteLink, 'utf8mb4')) {
+            throw new RuntimeException('Unable to set remote charset: ' . mysqli_error($remoteLink));
+        }
 
-        mysqli_set_charset($remoteLink, 'utf8mb4');
-        $remoteCount = remoteRowCount($remoteLink, $remoteTable);
-        $synced = syncRows($remoteLink, $localDb, $remoteTable, $localTable, $batchSize);
+        beginRemoteSnapshot($remoteLink);
+        try {
+            $remoteCount = remoteRowCount($remoteLink, $remoteTable);
+            $synced = syncRows($remoteLink, $localDb, $remoteTable, $stagingTable, $batchSize);
+            commitRemoteSnapshot($remoteLink);
+        } catch (RuntimeException $exception) {
+            rollbackRemoteSnapshot($remoteLink);
+            throw $exception;
+        }
+
+        validateMirrorCounts($remoteCount, $synced, array_key_exists('allow-empty', $options));
+        replaceLocalTableWithStaging($localDb, $localTable, $stagingTable, $backupTable);
+        if ($lockName !== null) {
+            releaseWordfenceVulnerabilityLock($localDb, $lockName);
+            $lockName = null;
+        }
         mysqli_close($remoteLink);
     } catch (RuntimeException $exception) {
+        if ($localDb instanceof DB && $lockName !== null) {
+            releaseWordfenceVulnerabilityLock($localDb, $lockName);
+        }
+        if ($remoteLink instanceof mysqli) {
+            @mysqli_close($remoteLink);
+        }
         fwrite(STDERR, $exception->getMessage() . "\n");
         exit(1);
     }
@@ -64,6 +96,7 @@ function main(array $argv): void
         'local_table' => $localTable,
         'remote_rows' => $remoteCount,
         'synced_rows' => $synced,
+        'mirrored' => true,
     ], JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES) . PHP_EOL;
 }
 
@@ -82,6 +115,7 @@ Options:
   --remote-user=USER         Remote MySQL user. Or WORDFENCE_REMOTE_DB_USER.
   --remote-password=PASSWORD Remote MySQL password. Or WORDFENCE_REMOTE_DB_PASSWORD.
   --batch-size=N             Optional rows per batch. Default: 1000.
+  --allow-empty              Permit replacing the local table with an empty remote mirror.
 
 TEXT;
 }
@@ -104,39 +138,64 @@ function remoteConnectionSettings(array $options): array
     return $settings;
 }
 
-function createLocalWordfenceTable(DB $db, string $table): void
+function stagingTableName(string $localTable): string
 {
-    $db->execute("
-        CREATE TABLE IF NOT EXISTS `{$table}` (
-            `vulnerability_id` varchar(64) NOT NULL,
-            `software_type` varchar(20) NOT NULL DEFAULT 'plugin',
-            `software_slug` varchar(191) NOT NULL,
-            `software_name` varchar(255) DEFAULT NULL,
-            `plugin_filter` varchar(255) DEFAULT NULL,
-            `feed` varchar(32) NOT NULL,
-            `title` text,
-            `cve` varchar(64) DEFAULT NULL,
-            `cvss_score` decimal(3,1) DEFAULT NULL,
-            `cvss_rating` varchar(32) DEFAULT NULL,
-            `patched` tinyint(1) DEFAULT NULL,
-            `published_at` datetime DEFAULT NULL,
-            `updated_at` datetime DEFAULT NULL,
-            `affected_versions_json` longtext,
-            `patched_versions_json` longtext,
-            `remediation` text,
-            `references_json` longtext,
-            `software_json` longtext,
-            `raw_record_json` longtext,
-            `last_seen_at` timestamp NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-            PRIMARY KEY (`vulnerability_id`, `software_type`, `software_slug`),
-            KEY `idx_software_slug` (`software_slug`),
-            KEY `idx_software_type_slug` (`software_type`, `software_slug`),
-            KEY `idx_cve` (`cve`),
-            KEY `idx_published_at` (`published_at`)
-        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
-    ");
+    return temporaryTableName($localTable, 'sync');
+}
 
-    ensureWordfenceVulnerabilityTableCompatible($db, $table);
+function backupTableName(string $localTable): string
+{
+    return temporaryTableName($localTable, 'old');
+}
+
+function temporaryTableName(string $baseTable, string $suffix): string
+{
+    $prefix = substr($baseTable, 0, 48);
+    return $prefix . '_' . $suffix . '_' . substr(sha1($baseTable), 0, 8);
+}
+
+function validateMirrorCounts(int $remoteCount, int $synced, bool $allowEmpty): void
+{
+    if ($synced !== $remoteCount) {
+        throw new RuntimeException("Synced {$synced} rows but remote count was {$remoteCount}; refusing to replace local table.");
+    }
+
+    if ($remoteCount === 0 && !$allowEmpty) {
+        throw new RuntimeException('Remote Wordfence table is empty; refusing to replace local table without --allow-empty.');
+    }
+}
+
+function prepareStagingTable(DB $db, string $stagingTable, string $backupTable): void
+{
+    $db->execute("DROP TABLE IF EXISTS `{$stagingTable}`");
+    $db->execute("DROP TABLE IF EXISTS `{$backupTable}`");
+    createWordfenceVulnerabilityTable($db, $stagingTable);
+}
+
+function replaceLocalTableWithStaging(DB $db, string $localTable, string $stagingTable, string $backupTable): void
+{
+    $db->execute("DROP TABLE IF EXISTS `{$backupTable}`");
+    $db->execute("RENAME TABLE `{$localTable}` TO `{$backupTable}`, `{$stagingTable}` TO `{$localTable}`");
+    $db->execute("DROP TABLE IF EXISTS `{$backupTable}`");
+}
+
+function beginRemoteSnapshot(mysqli $remoteLink): void
+{
+    if (!mysqli_query($remoteLink, 'START TRANSACTION READ ONLY')) {
+        throw new RuntimeException('Unable to start remote snapshot transaction: ' . mysqli_error($remoteLink));
+    }
+}
+
+function commitRemoteSnapshot(mysqli $remoteLink): void
+{
+    if (!mysqli_query($remoteLink, 'COMMIT')) {
+        throw new RuntimeException('Unable to commit remote snapshot transaction: ' . mysqli_error($remoteLink));
+    }
+}
+
+function rollbackRemoteSnapshot(mysqli $remoteLink): void
+{
+    @mysqli_query($remoteLink, 'ROLLBACK');
 }
 
 function remoteRowCount(mysqli $remoteLink, string $remoteTable): int
@@ -152,11 +211,11 @@ function remoteRowCount(mysqli $remoteLink, string $remoteTable): int
 
 function syncRows(mysqli $remoteLink, DB $localDb, string $remoteTable, string $localTable, int $batchSize): int
 {
-    $offset = 0;
+    $lastKey = null;
     $synced = 0;
 
     while (true) {
-        $result = mysqli_query($remoteLink, remoteSelectSql($remoteTable, $batchSize, $offset));
+        $result = mysqli_query($remoteLink, remoteSelectSql($remoteLink, $remoteTable, $batchSize, $lastKey));
         if (!$result) {
             throw new RuntimeException('Remote select query failed: ' . mysqli_error($remoteLink));
         }
@@ -171,22 +230,39 @@ function syncRows(mysqli $remoteLink, DB $localDb, string $remoteTable, string $
         }
 
         foreach ($rows as $row) {
-            upsertLocalVulnerabilityRow($localDb, $localTable, $row);
+            wordfenceUpsertVulnerabilityRow($localDb, $localTable, $row);
             $synced++;
         }
+
+        $lastRow = $rows[count($rows) - 1];
+        $lastKey = [
+            'vulnerability_id' => (string) $lastRow['vulnerability_id'],
+            'software_type' => (string) $lastRow['software_type'],
+            'software_slug' => (string) $lastRow['software_slug'],
+        ];
 
         if (count($rows) < $batchSize) {
             break;
         }
-
-        $offset += $batchSize;
     }
 
     return $synced;
 }
 
-function remoteSelectSql(string $remoteTable, int $limit, int $offset): string
+function remoteSelectSql(mysqli $remoteLink, string $remoteTable, int $limit, ?array $lastKey): string
 {
+    $where = '';
+    if ($lastKey !== null) {
+        $vulnerabilityId = remoteSqlString($remoteLink, $lastKey['vulnerability_id']);
+        $softwareType = remoteSqlString($remoteLink, $lastKey['software_type']);
+        $softwareSlug = remoteSqlString($remoteLink, $lastKey['software_slug']);
+        $where = "
+            WHERE `vulnerability_id` > {$vulnerabilityId}
+               OR (`vulnerability_id` = {$vulnerabilityId} AND `software_type` > {$softwareType})
+               OR (`vulnerability_id` = {$vulnerabilityId} AND `software_type` = {$softwareType} AND `software_slug` > {$softwareSlug})
+        ";
+    }
+
     return "
         SELECT
             `vulnerability_id`,
@@ -209,113 +285,13 @@ function remoteSelectSql(string $remoteTable, int $limit, int $offset): string
             `software_json`,
             `raw_record_json`
         FROM `{$remoteTable}`
+        {$where}
         ORDER BY `vulnerability_id`, `software_type`, `software_slug`
-        LIMIT {$limit} OFFSET {$offset}
+        LIMIT {$limit}
     ";
 }
 
-function upsertLocalVulnerabilityRow(DB $db, string $table, array $row): void
+function remoteSqlString(mysqli $remoteLink, string $value): string
 {
-    $values = [
-        'vulnerability_id' => sqlString($db, (string) $row['vulnerability_id']),
-        'software_type' => sqlString($db, (string) $row['software_type']),
-        'software_slug' => sqlString($db, (string) $row['software_slug']),
-        'software_name' => sqlNullableString($db, $row['software_name'] ?? null),
-        'plugin_filter' => sqlNullableString($db, $row['plugin_filter'] ?? null),
-        'feed' => sqlString($db, (string) $row['feed']),
-        'title' => sqlNullableString($db, $row['title'] ?? null),
-        'cve' => sqlNullableString($db, $row['cve'] ?? null),
-        'cvss_score' => sqlNullableNumber($row['cvss_score'] ?? null),
-        'cvss_rating' => sqlNullableString($db, $row['cvss_rating'] ?? null),
-        'patched' => sqlNullableInt($row['patched'] ?? null),
-        'published_at' => sqlNullableString($db, $row['published_at'] ?? null),
-        'updated_at' => sqlNullableString($db, $row['updated_at'] ?? null),
-        'affected_versions_json' => sqlNullableString($db, $row['affected_versions_json'] ?? null),
-        'patched_versions_json' => sqlNullableString($db, $row['patched_versions_json'] ?? null),
-        'remediation' => sqlNullableString($db, $row['remediation'] ?? null),
-        'references_json' => sqlNullableString($db, $row['references_json'] ?? null),
-        'software_json' => sqlNullableString($db, $row['software_json'] ?? null),
-        'raw_record_json' => sqlNullableString($db, $row['raw_record_json'] ?? null),
-    ];
-
-    $db->execute("
-        INSERT INTO `{$table}` (
-            `vulnerability_id`,
-            `software_type`,
-            `software_slug`,
-            `software_name`,
-            `plugin_filter`,
-            `feed`,
-            `title`,
-            `cve`,
-            `cvss_score`,
-            `cvss_rating`,
-            `patched`,
-            `published_at`,
-            `updated_at`,
-            `affected_versions_json`,
-            `patched_versions_json`,
-            `remediation`,
-            `references_json`,
-            `software_json`,
-            `raw_record_json`
-        ) VALUES (
-            {$values['vulnerability_id']},
-            {$values['software_type']},
-            {$values['software_slug']},
-            {$values['software_name']},
-            {$values['plugin_filter']},
-            {$values['feed']},
-            {$values['title']},
-            {$values['cve']},
-            {$values['cvss_score']},
-            {$values['cvss_rating']},
-            {$values['patched']},
-            {$values['published_at']},
-            {$values['updated_at']},
-            {$values['affected_versions_json']},
-            {$values['patched_versions_json']},
-            {$values['remediation']},
-            {$values['references_json']},
-            {$values['software_json']},
-            {$values['raw_record_json']}
-        )
-        ON DUPLICATE KEY UPDATE
-            `software_name` = VALUES(`software_name`),
-            `plugin_filter` = VALUES(`plugin_filter`),
-            `feed` = VALUES(`feed`),
-            `title` = VALUES(`title`),
-            `cve` = VALUES(`cve`),
-            `cvss_score` = VALUES(`cvss_score`),
-            `cvss_rating` = VALUES(`cvss_rating`),
-            `patched` = VALUES(`patched`),
-            `published_at` = VALUES(`published_at`),
-            `updated_at` = VALUES(`updated_at`),
-            `affected_versions_json` = VALUES(`affected_versions_json`),
-            `patched_versions_json` = VALUES(`patched_versions_json`),
-            `remediation` = VALUES(`remediation`),
-            `references_json` = VALUES(`references_json`),
-            `software_json` = VALUES(`software_json`),
-            `raw_record_json` = VALUES(`raw_record_json`),
-            `last_seen_at` = CURRENT_TIMESTAMP
-    ");
-}
-
-function sqlNullableString(DB $db, $value): string
-{
-    if ($value === null || $value === '') {
-        return 'NULL';
-    }
-
-    return sqlString($db, (string) $value);
-}
-
-function sqlNullableNumber($value): string
-{
-    return is_numeric($value) ? (string) (float) $value : 'NULL';
-}
-
-function sqlNullableInt($value): string
-{
-    return $value === null || $value === '' ? 'NULL' : (string) (int) $value;
+    return "'" . mysqli_real_escape_string($remoteLink, $value) . "'";
 }

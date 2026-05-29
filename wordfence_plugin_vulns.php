@@ -202,6 +202,7 @@ function processCachedFeed(
     }
 
     $db = null;
+    $lockName = null;
     $cacheHash = hash_file('sha256', $cacheFile);
     if ($cacheHash === false) {
         throw new RuntimeException("Unable to hash cache file: {$cacheFile}");
@@ -212,12 +213,18 @@ function processCachedFeed(
         validateTableName($importRunsTable);
         requireDbClass();
         $db = createDatabase();
+        $lockName = acquireWordfenceVulnerabilityLock($db, $table);
         createResultsTable($db, $table);
 
         if ($all && !$forceImport) {
             createImportRunsTable($db, $importRunsTable);
             $previous = previousSuccessfulImport($db, $importRunsTable, $feed, $softwareType, $table, $cacheHash);
-            if ($previous !== null) {
+            if ($previous !== null && importedRowsStillPresent($db, $table, $feed, $softwareType, $cacheHash, (int) $previous['saved_rows'])) {
+                if ($lockName !== null) {
+                    releaseWordfenceVulnerabilityLock($db, $lockName);
+                    $lockName = null;
+                }
+
                 return [
                     'matched_records' => (int) $previous['matched_records'],
                     'matched_software_rows' => (int) $previous['matched_software_rows'],
@@ -254,7 +261,7 @@ function processCachedFeed(
 
         if ($save && $db instanceof DB) {
             foreach ($softwareMatches as $software) {
-                saveMatchRow($db, $table, $outputRecord, $software, $pluginFilter, $feed);
+                saveMatchRow($db, $table, $outputRecord, $software, $pluginFilter, $feed, $cacheHash);
                 $savedRows++;
             }
         }
@@ -266,7 +273,12 @@ function processCachedFeed(
 
     if ($save && $db instanceof DB && $all) {
         createImportRunsTable($db, $importRunsTable);
+        $savedRows = wordfenceImportedRowCount($db, $table, $feed, $softwareType, $cacheHash);
         recordSuccessfulImport($db, $importRunsTable, $feed, $softwareType, $table, $cacheHash, $matchedRecords, $matchedSoftwareRows, $savedRows);
+    }
+
+    if ($db instanceof DB && $lockName !== null) {
+        releaseWordfenceVulnerabilityLock($db, $lockName);
     }
 
     return [
@@ -521,37 +533,7 @@ function withoutRawRecords(array $matches): array
 
 function createResultsTable(DB $db, string $table): void
 {
-    $db->execute("
-        CREATE TABLE IF NOT EXISTS `{$table}` (
-            `vulnerability_id` varchar(64) NOT NULL,
-            `software_type` varchar(20) NOT NULL DEFAULT 'plugin',
-            `software_slug` varchar(191) NOT NULL,
-            `software_name` varchar(255) DEFAULT NULL,
-            `plugin_filter` varchar(255) DEFAULT NULL,
-            `feed` varchar(32) NOT NULL,
-            `title` text,
-            `cve` varchar(64) DEFAULT NULL,
-            `cvss_score` decimal(3,1) DEFAULT NULL,
-            `cvss_rating` varchar(32) DEFAULT NULL,
-            `patched` tinyint(1) DEFAULT NULL,
-            `published_at` datetime DEFAULT NULL,
-            `updated_at` datetime DEFAULT NULL,
-            `affected_versions_json` longtext,
-            `patched_versions_json` longtext,
-            `remediation` text,
-            `references_json` longtext,
-            `software_json` longtext,
-            `raw_record_json` longtext,
-            `last_seen_at` timestamp NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-            PRIMARY KEY (`vulnerability_id`, `software_type`, `software_slug`),
-            KEY `idx_software_slug` (`software_slug`),
-            KEY `idx_software_type_slug` (`software_type`, `software_slug`),
-            KEY `idx_cve` (`cve`),
-            KEY `idx_published_at` (`published_at`)
-        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
-    ");
-
-    ensureWordfenceVulnerabilityTableCompatible($db, $table);
+    createWordfenceVulnerabilityTable($db, $table);
 }
 
 function createImportRunsTable(DB $db, string $table): void
@@ -590,6 +572,15 @@ function previousSuccessfulImport(DB $db, string $table, string $feed, string $s
     return is_array($row) ? $row : null;
 }
 
+function importedRowsStillPresent(DB $db, string $table, string $feed, string $softwareType, string $cacheHash, int $expectedSavedRows): bool
+{
+    if ($expectedSavedRows < 1) {
+        return false;
+    }
+
+    return wordfenceImportedRowCount($db, $table, $feed, $softwareType, $cacheHash) >= $expectedSavedRows;
+}
+
 function recordSuccessfulImport(DB $db, string $table, string $feed, string $softwareType, string $targetTable, string $cacheHash, int $matchedRecords, int $matchedSoftwareRows, int $savedRows): void
 {
     $db->execute("
@@ -618,12 +609,13 @@ function recordSuccessfulImport(DB $db, string $table, string $feed, string $sof
     ");
 }
 
-function saveMatchRow(DB $db, string $table, array $record, array $software, string $pluginFilter, string $feed): void
+function saveMatchRow(DB $db, string $table, array $record, array $software, string $pluginFilter, string $feed, string $cacheHash): void
 {
     $vulnerabilityId = (string) ($record['id'] ?? '');
     if ($vulnerabilityId === '') {
-        $vulnerabilityId = substr(sha1(json_encode($record, JSON_UNESCAPED_SLASHES)), 0, 32);
+        $vulnerabilityId = substr(sha1(wordfenceJsonValue($record)), 0, 32);
     }
+
     $softwareType = (string) ($software['type'] ?? 'plugin');
     if (!in_array($softwareType, ['plugin', 'core', 'theme'], true)) {
         $softwareType = 'unknown';
@@ -635,94 +627,29 @@ function saveMatchRow(DB $db, string $table, array $record, array $software, str
     }
 
     $cvss = is_array($record['cvss'] ?? null) ? $record['cvss'] : [];
-    $publishedAt = sqlDateOrNull($record['published'] ?? null);
-    $updatedAt = sqlDateOrNull($record['updated'] ?? null);
-    $patched = array_key_exists('patched', $software) ? ((bool) $software['patched'] ? '1' : '0') : 'NULL';
-    $cvssScore = isset($cvss['score']) && is_numeric($cvss['score']) ? (string) (float) $cvss['score'] : 'NULL';
 
-    $values = [
-        'vulnerability_id' => sqlString($db, $vulnerabilityId),
-        'software_type' => sqlString($db, $softwareType),
-        'software_slug' => sqlString($db, $softwareSlug),
-        'software_name' => sqlNullableString($db, $software['name'] ?? null),
-        'plugin_filter' => sqlString($db, $pluginFilter),
-        'feed' => sqlString($db, $feed),
-        'title' => sqlNullableString($db, $record['title'] ?? null),
-        'cve' => sqlNullableString($db, $record['cve'] ?? null),
-        'cvss_score' => $cvssScore,
-        'cvss_rating' => sqlNullableString($db, $cvss['rating'] ?? null),
-        'patched' => $patched,
-        'published_at' => $publishedAt,
-        'updated_at' => $updatedAt,
-        'affected_versions_json' => sqlJson($db, $software['affected_versions'] ?? null),
-        'patched_versions_json' => sqlJson($db, $software['patched_versions'] ?? null),
-        'remediation' => sqlNullableString($db, $software['remediation'] ?? null),
-        'references_json' => sqlJson($db, $record['references'] ?? []),
-        'software_json' => sqlJson($db, $software),
-        'raw_record_json' => sqlJson($db, $record['_raw'] ?? $record),
-    ];
-
-    $db->execute("
-        INSERT INTO `{$table}` (
-            `vulnerability_id`,
-            `software_type`,
-            `software_slug`,
-            `software_name`,
-            `plugin_filter`,
-            `feed`,
-            `title`,
-            `cve`,
-            `cvss_score`,
-            `cvss_rating`,
-            `patched`,
-            `published_at`,
-            `updated_at`,
-            `affected_versions_json`,
-            `patched_versions_json`,
-            `remediation`,
-            `references_json`,
-            `software_json`,
-            `raw_record_json`
-        ) VALUES (
-            {$values['vulnerability_id']},
-            {$values['software_type']},
-            {$values['software_slug']},
-            {$values['software_name']},
-            {$values['plugin_filter']},
-            {$values['feed']},
-            {$values['title']},
-            {$values['cve']},
-            {$values['cvss_score']},
-            {$values['cvss_rating']},
-            {$values['patched']},
-            {$values['published_at']},
-            {$values['updated_at']},
-            {$values['affected_versions_json']},
-            {$values['patched_versions_json']},
-            {$values['remediation']},
-            {$values['references_json']},
-            {$values['software_json']},
-            {$values['raw_record_json']}
-        )
-        ON DUPLICATE KEY UPDATE
-            `software_name` = VALUES(`software_name`),
-            `plugin_filter` = VALUES(`plugin_filter`),
-            `feed` = VALUES(`feed`),
-            `title` = VALUES(`title`),
-            `cve` = VALUES(`cve`),
-            `cvss_score` = VALUES(`cvss_score`),
-            `cvss_rating` = VALUES(`cvss_rating`),
-            `patched` = VALUES(`patched`),
-            `published_at` = VALUES(`published_at`),
-            `updated_at` = VALUES(`updated_at`),
-            `affected_versions_json` = VALUES(`affected_versions_json`),
-            `patched_versions_json` = VALUES(`patched_versions_json`),
-            `remediation` = VALUES(`remediation`),
-            `references_json` = VALUES(`references_json`),
-            `software_json` = VALUES(`software_json`),
-            `raw_record_json` = VALUES(`raw_record_json`),
-            `last_seen_at` = CURRENT_TIMESTAMP
-    ");
+    wordfenceUpsertVulnerabilityRow($db, $table, [
+        'vulnerability_id' => $vulnerabilityId,
+        'software_type' => $softwareType,
+        'software_slug' => $softwareSlug,
+        'software_name' => $software['name'] ?? null,
+        'plugin_filter' => $pluginFilter,
+        'feed' => $feed,
+        'title' => $record['title'] ?? null,
+        'cve' => $record['cve'] ?? null,
+        'cvss_score' => $cvss['score'] ?? null,
+        'cvss_rating' => $cvss['rating'] ?? null,
+        'patched' => array_key_exists('patched', $software) ? ((bool) $software['patched'] ? 1 : 0) : null,
+        'published_at' => normalizedSqlDate($record['published'] ?? null),
+        'updated_at' => normalizedSqlDate($record['updated'] ?? null),
+        'affected_versions_json' => wordfenceJsonValue($software['affected_versions'] ?? null),
+        'patched_versions_json' => wordfenceJsonValue($software['patched_versions'] ?? null),
+        'remediation' => $software['remediation'] ?? null,
+        'references_json' => wordfenceJsonValue($record['references'] ?? []),
+        'software_json' => wordfenceJsonValue($software),
+        'raw_record_json' => wordfenceJsonValue($record['_raw'] ?? $record),
+        'import_cache_sha256' => $cacheHash,
+    ]);
 }
 function sqlNullableString(DB $db, $value): string
 {
@@ -738,16 +665,22 @@ function sqlJson(DB $db, $value): string
     return sqlString($db, json_encode($value, JSON_UNESCAPED_SLASHES));
 }
 
-function sqlDateOrNull($value): string
+function normalizedSqlDate($value): ?string
 {
     if (!is_string($value) || trim($value) === '') {
-        return 'NULL';
+        return null;
     }
 
     $timestamp = strtotime($value);
     if ($timestamp === false) {
-        return 'NULL';
+        return null;
     }
 
-    return "'" . gmdate('Y-m-d H:i:s', $timestamp) . "'";
+    return gmdate('Y-m-d H:i:s', $timestamp);
+}
+
+function sqlDateOrNull($value): string
+{
+    $date = normalizedSqlDate($value);
+    return $date === null ? 'NULL' : "'" . $date . "'";
 }
