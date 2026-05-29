@@ -21,6 +21,7 @@ declare(strict_types=1);
 const WORDFENCE_PRODUCTION_ENDPOINT = 'https://www.wordfence.com/api/intelligence/v3/vulnerabilities/production';
 const WORDFENCE_SCANNER_ENDPOINT = 'https://www.wordfence.com/api/intelligence/v3/vulnerabilities/scanner';
 const DEFAULT_RESULTS_TABLE = 'wordfence_plugin_vulnerabilities';
+const DEFAULT_IMPORT_RUNS_TABLE = 'wordfence_import_runs';
 
 require_once __DIR__ . '/cli_helpers.php';
 
@@ -68,6 +69,8 @@ function main(array $argv): void
     $timeout = parsePositiveInt((string) ($options['timeout'] ?? '600'), 600);
     $cacheFile = (string) ($options['cache-file'] ?? defaultCacheFile($feed));
     $softwareType = strtolower((string) ($options['software'] ?? 'plugin'));
+    $importRunsTable = (string) ($options['import-runs-table'] ?? DEFAULT_IMPORT_RUNS_TABLE);
+    $forceImport = array_key_exists('force-import', $options);
 
     if (!in_array($softwareType, ['plugin', 'core', 'theme', 'all'], true)) {
         fwrite(STDERR, "Invalid --software value. Use plugin, core, theme, or all.\n");
@@ -79,7 +82,7 @@ function main(array $argv): void
             downloadJsonToCache($endpoint, $apiKey, $timeout, $cacheFile);
         }
 
-        $result = processCachedFeed($cacheFile, $all, $plugin, $exact, $save, $table, $all ? 'ALL' : $pluginOption, $feed, $softwareType);
+        $result = processCachedFeed($cacheFile, $all, $plugin, $exact, $save, $table, $all ? 'ALL' : $pluginOption, $feed, $softwareType, $importRunsTable, $forceImport);
     } catch (RuntimeException $exception) {
         fwrite(STDERR, $exception->getMessage() . "\n");
         exit(1);
@@ -95,6 +98,8 @@ function main(array $argv): void
         'matched_software_rows' => $result['matched_software_rows'],
         'saved_to_mysql' => $save,
         'saved_rows' => $result['saved_rows'],
+        'skipped_import' => $result['skipped_import'],
+        'cache_sha256' => $result['cache_sha256'],
         'table' => $save ? $table : null,
         'cache_file' => $cacheFile,
         'vulnerabilities' => $all ? [] : array_values(withoutRawRecords($result['matches'])),
@@ -120,9 +125,11 @@ Options:
   --feed=VALUE      Optional. production or scanner. Default: production.
   --exact           Optional. Require exact slug/name match instead of contains match.
   --table=VALUE     Optional. MySQL table to save into. Default: wordfence_plugin_vulnerabilities.
+  --import-runs-table=VALUE Optional import metadata table. Default: wordfence_import_runs.
   --timeout=SECONDS Optional. Download timeout. Default: 600.
   --cache-file=PATH Optional. Feed JSON cache path. Default: ./cache/wordfence-FEED.json.
   --use-cache       Optional. Skip download and read from cache file.
+  --force-import    Optional. Re-import even if this cache hash was imported already.
   --no-save         Optional. Print JSON without saving matches to MySQL.
 
 TEXT;
@@ -185,7 +192,9 @@ function processCachedFeed(
     string $table,
     string $pluginFilter,
     string $feed,
-    string $softwareType
+    string $softwareType,
+    string $importRunsTable,
+    bool $forceImport
 ): array
 {
     if (!is_file($cacheFile)) {
@@ -193,11 +202,32 @@ function processCachedFeed(
     }
 
     $db = null;
+    $cacheHash = hash_file('sha256', $cacheFile);
+    if ($cacheHash === false) {
+        throw new RuntimeException("Unable to hash cache file: {$cacheFile}");
+    }
+
     if ($save) {
         validateTableName($table);
+        validateTableName($importRunsTable);
         requireDbClass();
         $db = createDatabase();
         createResultsTable($db, $table);
+
+        if ($all && !$forceImport) {
+            createImportRunsTable($db, $importRunsTable);
+            $previous = previousSuccessfulImport($db, $importRunsTable, $feed, $softwareType, $table, $cacheHash);
+            if ($previous !== null) {
+                return [
+                    'matched_records' => (int) $previous['matched_records'],
+                    'matched_software_rows' => (int) $previous['matched_software_rows'],
+                    'saved_rows' => 0,
+                    'matches' => [],
+                    'skipped_import' => true,
+                    'cache_sha256' => $cacheHash,
+                ];
+            }
+        }
     }
 
     $matches = [];
@@ -234,11 +264,18 @@ function processCachedFeed(
         }
     }
 
+    if ($save && $db instanceof DB && $all) {
+        createImportRunsTable($db, $importRunsTable);
+        recordSuccessfulImport($db, $importRunsTable, $feed, $softwareType, $table, $cacheHash, $matchedRecords, $matchedSoftwareRows, $savedRows);
+    }
+
     return [
         'matched_records' => $matchedRecords,
         'matched_software_rows' => $matchedSoftwareRows,
         'saved_rows' => $savedRows,
         'matches' => $matches,
+        'skipped_import' => false,
+        'cache_sha256' => $cacheHash,
     ];
 }
 
@@ -515,6 +552,70 @@ function createResultsTable(DB $db, string $table): void
     ");
 
     ensureWordfenceVulnerabilityTableCompatible($db, $table);
+}
+
+function createImportRunsTable(DB $db, string $table): void
+{
+    $db->execute("
+        CREATE TABLE IF NOT EXISTS `{$table}` (
+            `id` bigint unsigned NOT NULL AUTO_INCREMENT,
+            `feed` varchar(32) NOT NULL,
+            `software_type` varchar(20) NOT NULL,
+            `target_table` varchar(191) NOT NULL,
+            `cache_sha256` char(64) NOT NULL,
+            `matched_records` int unsigned NOT NULL DEFAULT 0,
+            `matched_software_rows` int unsigned NOT NULL DEFAULT 0,
+            `saved_rows` int unsigned NOT NULL DEFAULT 0,
+            `imported_at` timestamp NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (`id`),
+            UNIQUE KEY `uniq_import_hash` (`feed`, `software_type`, `target_table`, `cache_sha256`),
+            KEY `idx_imported_at` (`imported_at`)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+    ");
+}
+
+function previousSuccessfulImport(DB $db, string $table, string $feed, string $softwareType, string $targetTable, string $cacheHash): ?array
+{
+    $result = $db->query("
+        SELECT `matched_records`, `matched_software_rows`, `saved_rows`, `imported_at`
+        FROM `{$table}`
+        WHERE `feed` = " . sqlString($db, $feed) . "
+          AND `software_type` = " . sqlString($db, $softwareType) . "
+          AND `target_table` = " . sqlString($db, $targetTable) . "
+          AND `cache_sha256` = " . sqlString($db, $cacheHash) . "
+        LIMIT 1
+    ");
+
+    $row = mysqli_fetch_assoc($result);
+    return is_array($row) ? $row : null;
+}
+
+function recordSuccessfulImport(DB $db, string $table, string $feed, string $softwareType, string $targetTable, string $cacheHash, int $matchedRecords, int $matchedSoftwareRows, int $savedRows): void
+{
+    $db->execute("
+        INSERT INTO `{$table}` (
+            `feed`,
+            `software_type`,
+            `target_table`,
+            `cache_sha256`,
+            `matched_records`,
+            `matched_software_rows`,
+            `saved_rows`
+        ) VALUES (
+            " . sqlString($db, $feed) . ",
+            " . sqlString($db, $softwareType) . ",
+            " . sqlString($db, $targetTable) . ",
+            " . sqlString($db, $cacheHash) . ",
+            {$matchedRecords},
+            {$matchedSoftwareRows},
+            {$savedRows}
+        )
+        ON DUPLICATE KEY UPDATE
+            `matched_records` = VALUES(`matched_records`),
+            `matched_software_rows` = VALUES(`matched_software_rows`),
+            `saved_rows` = VALUES(`saved_rows`),
+            `imported_at` = CURRENT_TIMESTAMP
+    ");
 }
 
 function saveMatchRow(DB $db, string $table, array $record, array $software, string $pluginFilter, string $feed): void

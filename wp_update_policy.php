@@ -167,6 +167,8 @@ function refreshWordfence(array $options, string $sitePath, string $vulnTable): 
         'count' => $decoded['count'] ?? null,
         'matched_software_rows' => $decoded['matched_software_rows'] ?? null,
         'saved_rows' => $decoded['saved_rows'] ?? null,
+        'skipped_import' => $decoded['skipped_import'] ?? null,
+        'cache_sha256' => $decoded['cache_sha256'] ?? null,
         'cache_file' => $decoded['cache_file'] ?? null,
     ];
 }
@@ -782,6 +784,7 @@ function policyEmailBody(array $policy, string $outputPath, ?array $wordfenceRef
         $lines[] = '  Feed: ' . (string) ($wordfenceRefresh['feed'] ?? '');
         $lines[] = '  Software: ' . (string) ($wordfenceRefresh['software'] ?? '');
         $lines[] = '  Saved rows: ' . (string) ($wordfenceRefresh['saved_rows'] ?? '');
+        $lines[] = '  Skipped import: ' . (!empty($wordfenceRefresh['skipped_import']) ? 'yes' : 'no');
         $lines[] = '  Cache file: ' . (string) ($wordfenceRefresh['cache_file'] ?? '');
         $lines[] = '';
     }
