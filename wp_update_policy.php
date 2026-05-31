@@ -23,7 +23,14 @@ main($argv);
 
 function main(array $argv): void
 {
-    $options = parseOptions($argv);
+    try {
+        $options = loadPolicySettings(parseOptions($argv));
+    } catch (RuntimeException $exception) {
+        fwrite(STDERR, $exception->getMessage() . "\n\n");
+        printUsage();
+        exit(1);
+    }
+
     $sitePath = rtrim((string) ($options['site'] ?? ''), DIRECTORY_SEPARATOR);
     if ($sitePath === '' || !is_dir($sitePath)) {
         fwrite(STDERR, "Missing or invalid --site path.\n\n");
@@ -44,6 +51,7 @@ function main(array $argv): void
     $versionsTable = (string) ($options['versions-table'] ?? DEFAULT_VERSIONS_TABLE);
     $output = (string) ($options['output'] ?? defaultPolicyPath($siteKey));
     $refreshWordfence = array_key_exists('refresh-wordfence', $options);
+    $ignoredVulnerabilities = parseIgnoredVulnerabilities((string) ($options['ignore-vuln'] ?? ''));
 
     validateTableName($vulnTable);
     validateTableName($assetsTable);
@@ -72,7 +80,8 @@ function main(array $argv): void
             $sitePath,
             $inventory,
             $normalHours,
-            $emergencyHours
+            $emergencyHours,
+            $ignoredVulnerabilities
         );
 
         writeJsonFile($output, $policy);
@@ -111,6 +120,7 @@ Options:
   --normal-days=N        Backward-compatible alias. Converted to hours.
   --emergency-days=N     Backward-compatible alias. Converted to hours.
   --output=PATH          Optional policy JSON output path.
+  --policy-settings=PATH Optional JSON settings file for policy generation options.
   --notify-email=ADDR    Optional. Email policy summary after generation.
   --no-notify            Optional. Disable policy email notification.
   --refresh-wordfence    Optional. Refresh Wordfence vulnerability DB before building policy.
@@ -121,8 +131,54 @@ Options:
   --vuln-table=VALUE     Optional Wordfence table. Default: wordfence_plugin_vulnerabilities.
   --assets-table=VALUE   Optional current asset table. Default: wp_update_assets.
   --versions-table=VALUE Optional first-seen versions table. Default: wp_update_versions.
+  --ignore-vuln=LIST     Optional comma-separated TYPE:SLUG:ID_OR_TITLE entries to suppress.
 
 TEXT;
+}
+
+function loadPolicySettings(array $cliOptions): array
+{
+    $settingsPath = (string) ($cliOptions['policy-settings'] ?? '');
+    if ($settingsPath === '') {
+        return $cliOptions;
+    }
+
+    if (!is_file($settingsPath)) {
+        throw new RuntimeException("Missing policy settings file: {$settingsPath}");
+    }
+
+    $json = file_get_contents($settingsPath);
+    if ($json === false) {
+        throw new RuntimeException("Unable to read policy settings file: {$settingsPath}");
+    }
+
+    $settings = json_decode($json, true);
+    if (!is_array($settings)) {
+        throw new RuntimeException("Invalid policy settings JSON: {$settingsPath}");
+    }
+
+    $options = [];
+    foreach ($settings as $key => $value) {
+        $optionKey = str_replace('_', '-', (string) $key);
+        if (is_bool($value)) {
+            if ($value) {
+                $options[$optionKey] = true;
+            }
+            continue;
+        }
+
+        if (is_array($value)) {
+            $value = implode(',', array_map(static fn($item): string => (string) $item, $value));
+        }
+
+        $options[$optionKey] = $value;
+    }
+
+    foreach ($cliOptions as $key => $value) {
+        $options[$key] = $value;
+    }
+
+    return $options;
 }
 
 function refreshWordfence(array $options, string $sitePath, string $vulnTable): array
@@ -356,7 +412,8 @@ function buildPolicy(
     string $sitePath,
     array $inventory,
     int $normalHours,
-    int $emergencyHours
+    int $emergencyHours,
+    array $ignoredVulnerabilities = []
 ): array {
     $now = gmdate('Y-m-d H:i:s');
     $policy = [
@@ -369,7 +426,7 @@ function buildPolicy(
             'normal_delay_days' => $normalHours / 24,
             'emergency_delay_days' => $emergencyHours / 24,
         ],
-        'core' => buildAssetPolicy($db, $versionsTable, $vulnTable, $siteKey, 'core', 'wordpress', 'WordPress Core', $inventory['core']['version'], $normalHours, $emergencyHours),
+        'core' => buildAssetPolicy($db, $versionsTable, $vulnTable, $siteKey, 'core', 'wordpress', 'WordPress Core', $inventory['core']['version'], $normalHours, $emergencyHours, 'active', $ignoredVulnerabilities),
         'plugins' => [],
     ];
 
@@ -385,7 +442,8 @@ function buildPolicy(
             $plugin['version'],
             $normalHours,
             $emergencyHours,
-            $plugin['status']
+            $plugin['status'],
+            $ignoredVulnerabilities
         );
     }
 
@@ -403,13 +461,17 @@ function buildAssetPolicy(
     string $currentVersion,
     int $normalHours,
     int $emergencyHours,
-    string $status = 'active'
+    string $status = 'active',
+    array $ignoredVulnerabilities = []
 ): array {
     $observedVersions = getObservedVersions($db, $versionsTable, $siteKey, $assetType, $slug);
-    $vulnerabilityRows = in_array($assetType, ['plugin', 'core'], true)
+    $allVulnerabilityRows = in_array($assetType, ['plugin', 'core'], true)
         ? loadVulnerabilitiesForAsset($db, $vulnTable, $assetType, $slug)
         : [];
+    $vulnerabilityRows = actionableVulnerabilityRows($allVulnerabilityRows, $assetType, $slug, $ignoredVulnerabilities);
+    $ignoredRows = ignoredVulnerabilityRows($allVulnerabilityRows, $assetType, $slug, $ignoredVulnerabilities);
     $currentVulns = findVulnerabilitiesForVersion($vulnerabilityRows, $currentVersion);
+    $ignoredCurrentVulns = findVulnerabilitiesForVersion($ignoredRows, $currentVersion);
     $normalCandidates = agedVersions($observedVersions, $currentVersion, $normalHours);
     $emergencyCandidates = agedVersions($observedVersions, $currentVersion, $emergencyHours);
 
@@ -424,6 +486,7 @@ function buildAssetPolicy(
         'current_version' => $currentVersion,
         'current_is_vulnerable' => count($currentVulns) > 0,
         'current_vulnerabilities' => $currentVulns,
+        'ignored_current_vulnerabilities' => $ignoredCurrentVulns,
         'allowed_update_version' => $normalVersion,
         'emergency_update_version' => $emergencyVersion,
         'observed_versions' => $observedVersions,
@@ -438,6 +501,70 @@ function recommendedAction(array $currentVulns, ?string $normalVersion, ?string 
     }
 
     return $normalVersion !== null ? 'normal_update' : 'hold';
+}
+
+function parseIgnoredVulnerabilities(string $value): array
+{
+    $rules = [];
+    foreach (array_filter(array_map('trim', explode(',', $value))) as $entry) {
+        $parts = explode(':', $entry, 3);
+        if (count($parts) !== 3) {
+            throw new RuntimeException('Invalid --ignore-vuln entry. Use TYPE:SLUG:ID_OR_TITLE.');
+        }
+
+        [$type, $slug, $identifier] = array_map('trim', $parts);
+        if ($type === '' || $slug === '' || $identifier === '') {
+            throw new RuntimeException('Invalid --ignore-vuln entry. TYPE, SLUG, and ID_OR_TITLE are required.');
+        }
+
+        $rules[] = [
+            'type' => normalizeVulnerabilityIdentifier($type),
+            'slug' => normalizeVulnerabilityIdentifier($slug),
+            'identifier' => normalizeVulnerabilityIdentifier($identifier),
+        ];
+    }
+
+    return $rules;
+}
+
+function actionableVulnerabilityRows(array $rows, string $assetType, string $slug, array $ignoredVulnerabilities): array
+{
+    return array_values(array_filter($rows, static function (array $row) use ($assetType, $slug, $ignoredVulnerabilities): bool {
+        return !vulnerabilityIsIgnored($row, $assetType, $slug, $ignoredVulnerabilities);
+    }));
+}
+
+function ignoredVulnerabilityRows(array $rows, string $assetType, string $slug, array $ignoredVulnerabilities): array
+{
+    return array_values(array_filter($rows, static function (array $row) use ($assetType, $slug, $ignoredVulnerabilities): bool {
+        return vulnerabilityIsIgnored($row, $assetType, $slug, $ignoredVulnerabilities);
+    }));
+}
+
+function vulnerabilityIsIgnored(array $row, string $assetType, string $slug, array $ignoredVulnerabilities): bool
+{
+    $type = normalizeVulnerabilityIdentifier($assetType);
+    $assetSlug = normalizeVulnerabilityIdentifier($slug);
+    $id = normalizeVulnerabilityIdentifier((string) ($row['id'] ?? ''));
+    $title = normalizeVulnerabilityIdentifier((string) ($row['title'] ?? ''));
+
+    foreach ($ignoredVulnerabilities as $rule) {
+        if (($rule['type'] ?? '') !== $type || ($rule['slug'] ?? '') !== $assetSlug) {
+            continue;
+        }
+
+        $identifier = (string) ($rule['identifier'] ?? '');
+        if ($identifier !== '' && ($identifier === $id || $identifier === $title)) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+function normalizeVulnerabilityIdentifier(string $value): string
+{
+    return strtolower(trim(preg_replace('/\s+/', ' ', $value) ?? $value));
 }
 
 function getObservedVersions(DB $db, string $versionsTable, string $siteKey, string $assetType, string $slug): array

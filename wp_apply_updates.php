@@ -15,7 +15,14 @@ main($argv);
 
 function main(array $argv): void
 {
-    $options = parseOptions($argv);
+    try {
+        $options = loadApplySettings(parseOptions($argv));
+    } catch (RuntimeException $exception) {
+        fwrite(STDERR, $exception->getMessage() . "\n\n");
+        printUsage();
+        exit(1);
+    }
+
     $policyPath = (string) ($options['policy'] ?? '');
     if ($policyPath === '' || !is_file($policyPath)) {
         fwrite(STDERR, "Missing or invalid --policy path.\n\n");
@@ -135,6 +142,7 @@ Options:
   --site=PATH         Optional override for policy site_path.
   --config=PATH       Optional private config file to parse before wp-config.php.
   --site-key=VALUE    Optional override for policy site_key.
+  --policy-settings=PATH Optional JSON settings file for apply options.
   --backup-db         Export database before applying updates.
   --backup-dir=PATH   Optional backup directory. Default: ./backups.
   --maintenance       Activate maintenance mode while applying updates.
@@ -148,6 +156,51 @@ Options:
   --max-policy-age=N  Maximum policy age in seconds before apply/dry-run fails. Default: 86400. Use 0 to disable.
 
 TEXT;
+}
+
+function loadApplySettings(array $cliOptions): array
+{
+    $settingsPath = (string) ($cliOptions['policy-settings'] ?? '');
+    if ($settingsPath === '') {
+        return $cliOptions;
+    }
+
+    if (!is_file($settingsPath)) {
+        throw new RuntimeException("Missing policy settings file: {$settingsPath}");
+    }
+
+    $json = file_get_contents($settingsPath);
+    if ($json === false) {
+        throw new RuntimeException("Unable to read policy settings file: {$settingsPath}");
+    }
+
+    $settings = json_decode($json, true);
+    if (!is_array($settings)) {
+        throw new RuntimeException("Invalid policy settings JSON: {$settingsPath}");
+    }
+
+    $options = [];
+    foreach ($settings as $key => $value) {
+        $optionKey = str_replace('_', '-', (string) $key);
+        if (is_bool($value)) {
+            if ($value) {
+                $options[$optionKey] = true;
+            }
+            continue;
+        }
+
+        if (is_array($value)) {
+            $value = implode(',', array_map(static fn($item): string => (string) $item, $value));
+        }
+
+        $options[$optionKey] = $value;
+    }
+
+    foreach ($cliOptions as $key => $value) {
+        $options[$key] = $value;
+    }
+
+    return $options;
 }
 
 function loadPolicy(string $path): array

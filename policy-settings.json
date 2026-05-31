@@ -1,0 +1,9 @@
+{
+  "normal_hours": 48,
+  "emergency_hours": 1,
+  "notify_email": "matt@hovr.co",
+  "ignore_vuln": [
+    "core:wordpress:WordPress Core - All known versions - Unauthenticated Blind Server Side Request Forgery",
+    "core:wordpress:WordPress Core - All Known Versions - Cleartext Storage of wp_signups.activation_key"
+  ]
+}
