@@ -16,7 +16,8 @@ main($argv);
 function main(array $argv): void
 {
     try {
-        $options = loadApplySettings(parseOptions($argv));
+        $cliOptions = parseOptions($argv);
+        $options = loadApplySettings($cliOptions);
     } catch (RuntimeException $exception) {
         fwrite(STDERR, $exception->getMessage() . "\n\n");
         printUsage();
@@ -57,7 +58,7 @@ function main(array $argv): void
         exit(1);
     }
 
-    $apply = array_key_exists('apply', $options);
+    $apply = array_key_exists('apply', $cliOptions);
     $backupDb = array_key_exists('backup-db', $options);
     $maintenance = array_key_exists('maintenance', $options);
     $notifyEmail = notificationEmail($options);
@@ -160,47 +161,7 @@ TEXT;
 
 function loadApplySettings(array $cliOptions): array
 {
-    $settingsPath = (string) ($cliOptions['policy-settings'] ?? '');
-    if ($settingsPath === '') {
-        return $cliOptions;
-    }
-
-    if (!is_file($settingsPath)) {
-        throw new RuntimeException("Missing policy settings file: {$settingsPath}");
-    }
-
-    $json = file_get_contents($settingsPath);
-    if ($json === false) {
-        throw new RuntimeException("Unable to read policy settings file: {$settingsPath}");
-    }
-
-    $settings = json_decode($json, true);
-    if (!is_array($settings)) {
-        throw new RuntimeException("Invalid policy settings JSON: {$settingsPath}");
-    }
-
-    $options = [];
-    foreach ($settings as $key => $value) {
-        $optionKey = str_replace('_', '-', (string) $key);
-        if (is_bool($value)) {
-            if ($value) {
-                $options[$optionKey] = true;
-            }
-            continue;
-        }
-
-        if (is_array($value)) {
-            $value = implode(',', array_map(static fn($item): string => (string) $item, $value));
-        }
-
-        $options[$optionKey] = $value;
-    }
-
-    foreach ($cliOptions as $key => $value) {
-        $options[$key] = $value;
-    }
-
-    return $options;
+    return loadOptionsWithSettings($cliOptions);
 }
 
 function loadPolicy(string $path): array
@@ -587,6 +548,12 @@ function optionalWpUser(array $options): ?string
 
 function parseCsvOption($value): array
 {
+    if (is_array($value)) {
+        return array_values(array_filter(array_map(static fn($item): string => trim((string) $item), $value), static function (string $item): bool {
+            return $item !== '';
+        }));
+    }
+
     if (!is_string($value) || trim($value) === '') {
         return [];
     }

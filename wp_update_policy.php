@@ -51,7 +51,7 @@ function main(array $argv): void
     $versionsTable = (string) ($options['versions-table'] ?? DEFAULT_VERSIONS_TABLE);
     $output = (string) ($options['output'] ?? defaultPolicyPath($siteKey));
     $refreshWordfence = array_key_exists('refresh-wordfence', $options);
-    $ignoredVulnerabilities = parseIgnoredVulnerabilities((string) ($options['ignore-vuln'] ?? ''));
+    $ignoredVulnerabilities = parseIgnoredVulnerabilities($options['ignore-vuln'] ?? '');
 
     validateTableName($vulnTable);
     validateTableName($assetsTable);
@@ -138,47 +138,7 @@ TEXT;
 
 function loadPolicySettings(array $cliOptions): array
 {
-    $settingsPath = (string) ($cliOptions['policy-settings'] ?? '');
-    if ($settingsPath === '') {
-        return $cliOptions;
-    }
-
-    if (!is_file($settingsPath)) {
-        throw new RuntimeException("Missing policy settings file: {$settingsPath}");
-    }
-
-    $json = file_get_contents($settingsPath);
-    if ($json === false) {
-        throw new RuntimeException("Unable to read policy settings file: {$settingsPath}");
-    }
-
-    $settings = json_decode($json, true);
-    if (!is_array($settings)) {
-        throw new RuntimeException("Invalid policy settings JSON: {$settingsPath}");
-    }
-
-    $options = [];
-    foreach ($settings as $key => $value) {
-        $optionKey = str_replace('_', '-', (string) $key);
-        if (is_bool($value)) {
-            if ($value) {
-                $options[$optionKey] = true;
-            }
-            continue;
-        }
-
-        if (is_array($value)) {
-            $value = implode(',', array_map(static fn($item): string => (string) $item, $value));
-        }
-
-        $options[$optionKey] = $value;
-    }
-
-    foreach ($cliOptions as $key => $value) {
-        $options[$key] = $value;
-    }
-
-    return $options;
+    return loadOptionsWithSettings($cliOptions);
 }
 
 function refreshWordfence(array $options, string $sitePath, string $vulnTable): array
@@ -503,16 +463,35 @@ function recommendedAction(array $currentVulns, ?string $normalVersion, ?string 
     return $normalVersion !== null ? 'normal_update' : 'hold';
 }
 
-function parseIgnoredVulnerabilities(string $value): array
+function parseIgnoredVulnerabilities($value): array
 {
+    if ($value === '' || $value === null || $value === false) {
+        return [];
+    }
+
+    if (is_array($value) && (array_key_exists('type', $value) || array_key_exists('slug', $value))) {
+        $entries = [$value];
+    } else {
+        $entries = is_array($value)
+            ? $value
+            : array_filter(array_map('trim', explode(',', (string) $value)));
+    }
+
     $rules = [];
-    foreach (array_filter(array_map('trim', explode(',', $value))) as $entry) {
-        $parts = explode(':', $entry, 3);
-        if (count($parts) !== 3) {
-            throw new RuntimeException('Invalid --ignore-vuln entry. Use TYPE:SLUG:ID_OR_TITLE.');
+    foreach ($entries as $entry) {
+        if (is_array($entry)) {
+            $type = trim((string) ($entry['type'] ?? ''));
+            $slug = trim((string) ($entry['slug'] ?? ''));
+            $identifier = trim((string) ($entry['identifier'] ?? $entry['id'] ?? $entry['title'] ?? ''));
+        } else {
+            $parts = explode(':', trim((string) $entry), 3);
+            if (count($parts) !== 3) {
+                throw new RuntimeException('Invalid --ignore-vuln entry. Use TYPE:SLUG:ID_OR_TITLE.');
+            }
+
+            [$type, $slug, $identifier] = array_map('trim', $parts);
         }
 
-        [$type, $slug, $identifier] = array_map('trim', $parts);
         if ($type === '' || $slug === '' || $identifier === '') {
             throw new RuntimeException('Invalid --ignore-vuln entry. TYPE, SLUG, and ID_OR_TITLE are required.');
         }

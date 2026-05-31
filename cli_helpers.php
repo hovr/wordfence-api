@@ -23,6 +23,47 @@ function parseOptions(array $argv): array
     return $options;
 }
 
+function loadOptionsWithSettings(array $cliOptions, string $settingsOption = 'policy-settings', string $settingsLabel = 'policy settings'): array
+{
+    $settingsPath = (string) ($cliOptions[$settingsOption] ?? '');
+    if ($settingsPath === '') {
+        return $cliOptions;
+    }
+
+    if (!is_file($settingsPath)) {
+        throw new RuntimeException("Missing {$settingsLabel} file: {$settingsPath}");
+    }
+
+    $json = file_get_contents($settingsPath);
+    if ($json === false) {
+        throw new RuntimeException("Unable to read {$settingsLabel} file: {$settingsPath}");
+    }
+
+    $settings = json_decode($json, true);
+    if (!is_array($settings)) {
+        throw new RuntimeException("Invalid {$settingsLabel} JSON: {$settingsPath}");
+    }
+
+    $options = [];
+    foreach ($settings as $key => $value) {
+        $optionKey = str_replace('_', '-', (string) $key);
+        if (is_bool($value)) {
+            if ($value) {
+                $options[$optionKey] = true;
+            }
+            continue;
+        }
+
+        $options[$optionKey] = $value;
+    }
+
+    foreach ($cliOptions as $key => $value) {
+        $options[$key] = $value;
+    }
+
+    return $options;
+}
+
 function loadConfigForOptions(array $options): void
 {
     foreach (configPathsForOptions($options) as $configPath) {
