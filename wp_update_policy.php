@@ -794,8 +794,17 @@ function notifyPolicy(array $policy, string $outputPath, ?array $wordfenceRefres
     }
 
     $counts = policyActionCounts($policy);
+    $summary = policySubjectSummary($counts);
+    if ($summary === 'no updates' && !isNoUpdateNotificationWindow()) {
+        return [
+            'sent' => false,
+            'reason' => 'no_updates_outside_9am',
+            'counts' => $counts,
+        ];
+    }
+
     $subject = '[WordPress Update Policy] ' . (string) ($policy['site_key'] ?? 'site')
-        . ' - ' . policySubjectSummary($counts);
+        . ' - ' . $summary;
     $body = policyEmailBody($policy, $outputPath, $wordfenceRefresh, $counts);
     $headers = 'From: WordPress Update Policy <wordpress-updates@localhost>';
     $sent = mail($email, $subject, $body, $headers);
@@ -843,6 +852,11 @@ function policyAssets(array $policy): array
     }
 
     return $assets;
+}
+
+function isNoUpdateNotificationWindow(): bool
+{
+    return (int) date('G') === 9;
 }
 
 function policySubjectSummary(array $counts): string
