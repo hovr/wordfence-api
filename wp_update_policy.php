@@ -949,7 +949,7 @@ function policyEmailBody(array $policy, string $outputPath, ?array $wordfenceRef
     );
     appendPolicyEmailGroup(
         $lines,
-        'Assets requiring emergency action (will be updated automatically in the next emergency run):',
+        'Assets eligible for emergency action (planned for the next emergency/all apply run):',
         $groups['emergency_action']
     );
     appendPolicyEmailGroup(
@@ -959,7 +959,7 @@ function policyEmailBody(array $policy, string $outputPath, ?array $wordfenceRef
     );
     appendPolicyEmailGroup(
         $lines,
-        'Assets requiring normal action (will be updated automatically in the next normal/all run):',
+        'Assets eligible for normal action (planned for the next normal/all apply run):',
         $groups['normal_action']
     );
     appendPolicyEmailGroup($lines, 'Assets requiring manual review:', $groups['manual_review']);
