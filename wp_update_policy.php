@@ -825,8 +825,8 @@ function notifyPolicy(array $policy, string $outputPath, ?array $wordfenceRefres
     }
 
     $counts = policyActionCounts($policy);
-    $summary = policySubjectSummary($counts);
     $groups = policyUpdateEmailGroupsForPolicy($policy);
+    $summary = policySubjectSummary($counts, $groups);
     if ($summary === 'no updates' && !policyEmailGroupsHaveAssets($groups) && !isNoUpdateNotificationWindow()) {
         return [
             'sent' => false,
@@ -892,7 +892,7 @@ function isNoUpdateNotificationWindow(): bool
     return (int) date('G') === 9;
 }
 
-function policySubjectSummary(array $counts): string
+function policySubjectSummary(array $counts, array $groups = []): string
 {
     if (($counts['manual_review'] ?? 0) > 0) {
         return $counts['manual_review'] . ' manual review';
@@ -904,6 +904,11 @@ function policySubjectSummary(array $counts): string
 
     if (($counts['normal_update'] ?? 0) > 0) {
         return $counts['normal_update'] . ' normal update';
+    }
+
+    $pendingUpdates = count($groups['emergency_waiting'] ?? []) + count($groups['normal_waiting'] ?? []);
+    if ($pendingUpdates > 0) {
+        return $pendingUpdates . ' pending ' . ($pendingUpdates === 1 ? 'update' : 'updates');
     }
 
     return 'no updates';
