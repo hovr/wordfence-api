@@ -909,37 +909,195 @@ function policyEmailBody(array $policy, string $outputPath, ?array $wordfenceRef
         $lines[] = '';
     }
 
-    $notable = array_filter(policyAssets($policy), static function (array $asset): bool {
-        return in_array((string) ($asset['recommended_action'] ?? 'hold'), ['manual_review', 'emergency_update', 'normal_update'], true);
-    });
+    $groups = policyUpdateEmailGroups(
+        $policy,
+        (int) ($rules['normal_delay_hours'] ?? 0),
+        (int) ($rules['emergency_delay_hours'] ?? 0)
+    );
 
-    if ($notable !== []) {
-        $lines[] = 'Assets requiring action:';
-        foreach ($notable as $asset) {
-            $lines[] = '  - ' . strtoupper((string) ($asset['type'] ?? 'asset'))
-                . ' ' . (string) ($asset['slug'] ?? '')
-                . ' ' . (string) ($asset['current_version'] ?? '')
-                . ' => ' . (string) ($asset['recommended_action'] ?? 'hold')
-                . targetVersionSummary($asset);
-        }
-        $lines[] = '';
-    }
+    appendPolicyEmailGroup(
+        $lines,
+        'Assets with emergency updates but still within the ' . (string) ($rules['emergency_delay_hours'] ?? '') . ' hour delay:',
+        $groups['emergency_waiting']
+    );
+    appendPolicyEmailGroup(
+        $lines,
+        'Assets requiring emergency action (will be updated automatically in the next emergency run):',
+        $groups['emergency_action']
+    );
+    appendPolicyEmailGroup(
+        $lines,
+        'Assets with updates but still within the ' . (string) ($rules['normal_delay_hours'] ?? '') . ' hour delay:',
+        $groups['normal_waiting']
+    );
+    appendPolicyEmailGroup(
+        $lines,
+        'Assets requiring normal action (will be updated automatically in the next normal/all run):',
+        $groups['normal_action']
+    );
+    appendPolicyEmailGroup($lines, 'Assets requiring manual review:', $groups['manual_review']);
 
     return implode("\n", $lines);
 }
 
-function targetVersionSummary(array $asset): string
+function appendPolicyEmailGroup(array &$lines, string $heading, array $assets): void
 {
-    $action = (string) ($asset['recommended_action'] ?? 'hold');
-    if ($action === 'emergency_update' && !empty($asset['emergency_update_version'])) {
-        return ' to ' . (string) $asset['emergency_update_version'];
+    if ($assets === []) {
+        return;
     }
 
-    if ($action === 'normal_update' && !empty($asset['allowed_update_version'])) {
-        return ' to ' . (string) $asset['allowed_update_version'];
+    $lines[] = $heading;
+    foreach ($assets as $asset) {
+        $lines[] = '  - ' . policyEmailAssetLine($asset);
+    }
+    $lines[] = '';
+}
+
+function policyUpdateEmailGroups(array $policy, int $normalHours, int $emergencyHours): array
+{
+    $groups = [
+        'emergency_waiting' => [],
+        'emergency_action' => [],
+        'normal_waiting' => [],
+        'normal_action' => [],
+        'manual_review' => [],
+    ];
+
+    foreach (policyAssets($policy) as $asset) {
+        $action = (string) ($asset['recommended_action'] ?? 'hold');
+        $currentVersion = (string) ($asset['current_version'] ?? '');
+        $latestUpdate = newestObservedUpdate($asset, $currentVersion);
+        $currentIsVulnerable = !empty($asset['current_is_vulnerable']);
+
+        if ($currentIsVulnerable) {
+            $hasWaitingEmergencyUpdate = false;
+            $emergencyTarget = (string) ($asset['emergency_update_version'] ?? '');
+            if ($emergencyTarget !== '') {
+                $groups['emergency_action'][] = policyEmailAssetSummary($asset, $emergencyTarget, 'emergency_update');
+            }
+
+            if ($latestUpdate !== null && ($emergencyTarget === '' || compareVersions((string) $latestUpdate['version'], $emergencyTarget) > 0)) {
+                $note = waitTimeSummary($latestUpdate, $emergencyHours);
+                if (isDelayWaitingSummary($note)) {
+                    $groups['emergency_waiting'][] = policyEmailAssetSummary(
+                        $asset,
+                        (string) $latestUpdate['version'],
+                        'emergency_waiting',
+                        $note
+                    );
+                    $hasWaitingEmergencyUpdate = true;
+                }
+            }
+
+            if ($action === 'manual_review' && !$hasWaitingEmergencyUpdate) {
+                $groups['manual_review'][] = policyEmailAssetSummary($asset, null, $action);
+            }
+
+            continue;
+        }
+
+        $normalTarget = (string) ($asset['allowed_update_version'] ?? '');
+        if ($normalTarget !== '') {
+            $groups['normal_action'][] = policyEmailAssetSummary($asset, $normalTarget, 'normal_update');
+        }
+
+        if ($latestUpdate !== null && ($normalTarget === '' || compareVersions((string) $latestUpdate['version'], $normalTarget) > 0)) {
+            $note = waitTimeSummary($latestUpdate, $normalHours);
+            if (isDelayWaitingSummary($note)) {
+                $groups['normal_waiting'][] = policyEmailAssetSummary(
+                    $asset,
+                    (string) $latestUpdate['version'],
+                    'normal_waiting',
+                    $note
+                );
+            }
+        }
+
+        if ($action === 'manual_review') {
+            $groups['manual_review'][] = policyEmailAssetSummary($asset, null, $action);
+        }
     }
 
-    return '';
+    return $groups;
+}
+
+function isDelayWaitingSummary(string $summary): bool
+{
+    return $summary !== '' && $summary !== 'delay elapsed';
+}
+
+function newestObservedUpdate(array $asset, string $currentVersion): ?array
+{
+    $updates = [];
+    foreach (($asset['observed_versions'] ?? []) as $observed) {
+        if (!is_array($observed)) {
+            continue;
+        }
+
+        $version = (string) ($observed['version'] ?? '');
+        if ($version === '' || compareVersions($version, $currentVersion) <= 0) {
+            continue;
+        }
+
+        $updates[] = $observed;
+    }
+
+    if ($updates === []) {
+        return null;
+    }
+
+    usort($updates, static function (array $a, array $b): int {
+        return compareVersions((string) ($b['version'] ?? ''), (string) ($a['version'] ?? ''));
+    });
+
+    return $updates[0];
+}
+
+function waitTimeSummary(array $observed, int $delayHours): string
+{
+    $firstSeen = strtotime((string) ($observed['first_seen_at'] ?? ''));
+    if ($firstSeen === false || $delayHours < 1) {
+        return '';
+    }
+
+    $readyAt = $firstSeen + ($delayHours * 3600);
+    $remainingSeconds = $readyAt - time();
+    if ($remainingSeconds <= 0) {
+        return 'delay elapsed';
+    }
+
+    $remainingHours = (int) ceil($remainingSeconds / 3600);
+    return 'about ' . $remainingHours . 'h remaining';
+}
+
+function policyEmailAssetSummary(array $asset, ?string $targetVersion, string $action, string $note = ''): array
+{
+    return [
+        'type' => (string) ($asset['type'] ?? 'asset'),
+        'slug' => (string) ($asset['slug'] ?? ''),
+        'current_version' => (string) ($asset['current_version'] ?? ''),
+        'target_version' => $targetVersion,
+        'action' => $action,
+        'note' => $note,
+    ];
+}
+
+function policyEmailAssetLine(array $asset): string
+{
+    $line = strtoupper((string) ($asset['type'] ?? 'asset'))
+        . ' ' . (string) ($asset['slug'] ?? '')
+        . ' ' . (string) ($asset['current_version'] ?? '')
+        . ' => ' . (string) ($asset['action'] ?? '');
+
+    if (!empty($asset['target_version'])) {
+        $line .= ' to ' . (string) $asset['target_version'];
+    }
+
+    if (!empty($asset['note'])) {
+        $line .= ' (' . (string) $asset['note'] . ')';
+    }
+
+    return $line;
 }
 
 function notificationEmail(array $options): string
