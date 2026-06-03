@@ -886,6 +886,7 @@ function policyAssets(array $policy): array
 
 function isNoUpdateNotificationWindow(): bool
 {
+    // Intentionally use the PHP/server local timezone for the routine 9am no-update summary.
     return (int) date('G') === 9;
 }
 
