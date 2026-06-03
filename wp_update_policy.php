@@ -824,7 +824,8 @@ function notifyPolicy(array $policy, string $outputPath, ?array $wordfenceRefres
 
     $counts = policyActionCounts($policy);
     $summary = policySubjectSummary($counts);
-    if ($summary === 'no updates' && !isNoUpdateNotificationWindow()) {
+    $groups = policyUpdateEmailGroupsForPolicy($policy);
+    if ($summary === 'no updates' && !policyEmailGroupsHaveAssets($groups) && !isNoUpdateNotificationWindow()) {
         return [
             'sent' => false,
             'reason' => 'no_updates_outside_9am',
@@ -834,7 +835,7 @@ function notifyPolicy(array $policy, string $outputPath, ?array $wordfenceRefres
 
     $subject = '[WordPress Update Policy] ' . (string) ($policy['site_key'] ?? 'site')
         . ' - ' . $summary;
-    $body = policyEmailBody($policy, $outputPath, $wordfenceRefresh, $counts);
+    $body = policyEmailBody($policy, $outputPath, $wordfenceRefresh, $counts, $groups);
     $headers = 'From: WordPress Update Policy <wordpress-updates@localhost>';
     $sent = mail($email, $subject, $body, $headers);
 
@@ -905,7 +906,7 @@ function policySubjectSummary(array $counts): string
     return 'no updates';
 }
 
-function policyEmailBody(array $policy, string $outputPath, ?array $wordfenceRefresh, array $counts): string
+function policyEmailBody(array $policy, string $outputPath, ?array $wordfenceRefresh, array $counts, ?array $groups = null): string
 {
     $rules = is_array($policy['rules'] ?? null) ? $policy['rules'] : [];
     $lines = [
@@ -938,11 +939,7 @@ function policyEmailBody(array $policy, string $outputPath, ?array $wordfenceRef
         $lines[] = '';
     }
 
-    $groups = policyUpdateEmailGroups(
-        $policy,
-        (int) ($rules['normal_delay_hours'] ?? 0),
-        (int) ($rules['emergency_delay_hours'] ?? 0)
-    );
+    $groups = $groups ?? policyUpdateEmailGroupsForPolicy($policy);
 
     appendPolicyEmailGroup(
         $lines,
@@ -967,6 +964,28 @@ function policyEmailBody(array $policy, string $outputPath, ?array $wordfenceRef
     appendPolicyEmailGroup($lines, 'Assets requiring manual review:', $groups['manual_review']);
 
     return implode("\n", $lines);
+}
+
+function policyUpdateEmailGroupsForPolicy(array $policy): array
+{
+    $rules = is_array($policy['rules'] ?? null) ? $policy['rules'] : [];
+
+    return policyUpdateEmailGroups(
+        $policy,
+        (int) ($rules['normal_delay_hours'] ?? 0),
+        (int) ($rules['emergency_delay_hours'] ?? 0)
+    );
+}
+
+function policyEmailGroupsHaveAssets(array $groups): bool
+{
+    foreach ($groups as $assets) {
+        if (is_array($assets) && $assets !== []) {
+            return true;
+        }
+    }
+
+    return false;
 }
 
 function appendPolicyEmailGroup(array &$lines, string $heading, array $assets): void
