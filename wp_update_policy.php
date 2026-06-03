@@ -19,7 +19,9 @@ const DEFAULT_POLICY_DIR = 'policies';
 
 require_once __DIR__ . '/cli_helpers.php';
 
-main($argv);
+if (realpath((string) ($_SERVER['SCRIPT_FILENAME'] ?? '')) === __FILE__) {
+    main($argv);
+}
 
 function main(array $argv): void
 {
