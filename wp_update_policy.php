@@ -1021,7 +1021,6 @@ function policyUpdateEmailGroups(array $policy, int $normalHours, int $emergency
         $currentIsVulnerable = !empty($asset['current_is_vulnerable']);
 
         if ($currentIsVulnerable) {
-            $hasWaitingEmergencyUpdate = false;
             $emergencyTarget = (string) ($asset['emergency_update_version'] ?? '');
             if ($emergencyTarget !== '') {
                 $groups['emergency_action'][] = policyEmailAssetSummary($asset, $emergencyTarget, 'emergency_update');
@@ -1036,11 +1035,10 @@ function policyUpdateEmailGroups(array $policy, int $normalHours, int $emergency
                         'emergency_waiting',
                         $note
                     );
-                    $hasWaitingEmergencyUpdate = true;
                 }
             }
 
-            if ($action === 'manual_review' && !$hasWaitingEmergencyUpdate) {
+            if ($action === 'manual_review') {
                 $groups['manual_review'][] = policyEmailAssetSummary($asset, null, $action);
             }
 
