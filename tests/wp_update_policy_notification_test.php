@@ -82,6 +82,20 @@ $manualReviewGroups = policyUpdateEmailGroupsForPolicy($manualReviewPolicy);
 assertSameValue(1, count($manualReviewGroups['manual_review']), 'Manual-review assets should remain visible when no safe waiting update exists.');
 assertSameValue(0, count($manualReviewGroups['emergency_waiting']), 'Unsafe waiting updates should not be shown as emergency waiting updates.');
 
+$vulnerableWaitingPolicy = $manualReviewPolicy;
+$vulnerableWaitingPolicy['core']['safe_observed_versions'] = [
+    [
+        'version' => '2.1.0',
+        'source' => 'candidate',
+        'first_seen_at' => gmdate('Y-m-d H:i:s', time() - 3600),
+        'last_seen_at' => gmdate('Y-m-d H:i:s'),
+    ],
+];
+$vulnerableWaitingGroups = policyUpdateEmailGroupsForPolicy($vulnerableWaitingPolicy);
+assertSameValue(1, count($vulnerableWaitingGroups['emergency_waiting']), 'Safe emergency updates within delay should appear in the waiting group.');
+assertSameValue(1, count($vulnerableWaitingGroups['manual_review']), 'Vulnerable assets should remain in manual review while a safe update is still waiting.');
+assertSameValue('1 manual review', policySubjectSummary(policyActionCounts($vulnerableWaitingPolicy), $vulnerableWaitingGroups), 'Manual-review subject should stay consistent for vulnerable waiting assets.');
+
 $waitingPolicy = [
     'site_key' => 'example-site',
     'site_path' => '/var/www/example',
@@ -113,6 +127,7 @@ $waitingPolicy = [
 $waitingGroups = policyUpdateEmailGroupsForPolicy($waitingPolicy);
 assertSameValue(1, count($waitingGroups['normal_waiting']), 'Pending safe updates should appear in the normal waiting group.');
 assertTrueValue(policyEmailGroupsHaveAssets($waitingGroups), 'Waiting groups should prevent no-update suppression.');
+assertSameValue('1 pending update', policySubjectSummary(policyActionCounts($waitingPolicy), $waitingGroups), 'Waiting-only emails should not use a no-updates subject.');
 
 $body = policyEmailBody(
     $waitingPolicy,
