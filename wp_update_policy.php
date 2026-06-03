@@ -450,6 +450,7 @@ function buildAssetPolicy(
         'allowed_update_version' => $normalVersion,
         'emergency_update_version' => $emergencyVersion,
         'observed_versions' => $observedVersions,
+        'safe_observed_versions' => safeObservedVersions($vulnerabilityRows, $observedVersions, $currentVersion),
         'recommended_action' => recommendedAction($currentVulns, $normalVersion, $emergencyVersion),
     ];
 }
@@ -608,6 +609,34 @@ function newestSafeVersion(array $vulnerabilityRows, array $versions): ?string
     }
 
     return null;
+}
+
+function safeObservedVersions(array $vulnerabilityRows, array $observedVersions, string $currentVersion): array
+{
+    $safeVersions = [];
+
+    foreach ($observedVersions as $observed) {
+        if (!is_array($observed)) {
+            continue;
+        }
+
+        $version = (string) ($observed['version'] ?? '');
+        if ($version === '' || compareVersions($version, $currentVersion) <= 0) {
+            continue;
+        }
+
+        if (findVulnerabilitiesForVersion($vulnerabilityRows, $version) !== []) {
+            continue;
+        }
+
+        $safeVersions[] = $observed;
+    }
+
+    usort($safeVersions, static function (array $a, array $b): int {
+        return compareVersions((string) ($a['version'] ?? ''), (string) ($b['version'] ?? ''));
+    });
+
+    return $safeVersions;
 }
 
 function loadVulnerabilitiesForAsset(DB $db, string $vulnTable, string $assetType, string $slug): array
@@ -966,7 +995,7 @@ function policyUpdateEmailGroups(array $policy, int $normalHours, int $emergency
     foreach (policyAssets($policy) as $asset) {
         $action = (string) ($asset['recommended_action'] ?? 'hold');
         $currentVersion = (string) ($asset['current_version'] ?? '');
-        $latestUpdate = newestObservedUpdate($asset, $currentVersion);
+        $latestUpdate = newestSafeObservedUpdate($asset, $currentVersion);
         $currentIsVulnerable = !empty($asset['current_is_vulnerable']);
 
         if ($currentIsVulnerable) {
@@ -1026,10 +1055,10 @@ function isDelayWaitingSummary(string $summary): bool
     return $summary !== '' && $summary !== 'delay elapsed';
 }
 
-function newestObservedUpdate(array $asset, string $currentVersion): ?array
+function newestSafeObservedUpdate(array $asset, string $currentVersion): ?array
 {
     $updates = [];
-    foreach (($asset['observed_versions'] ?? []) as $observed) {
+    foreach (($asset['safe_observed_versions'] ?? []) as $observed) {
         if (!is_array($observed)) {
             continue;
         }
