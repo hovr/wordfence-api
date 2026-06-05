@@ -5,5 +5,8 @@
   "ignore_vuln": [
     "core:wordpress:WordPress Core - All known versions - Unauthenticated Blind Server Side Request Forgery",
     "core:wordpress:WordPress Core - All Known Versions - Cleartext Storage of wp_signups.activation_key"
+  ],
+  "premium_plugins": [
+    "advanced-custom-fields-pro"
   ]
 }

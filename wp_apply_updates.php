@@ -70,6 +70,7 @@ function main(array $argv): void
         'plugin' => isset($options['plugin']) ? (string) $options['plugin'] : null,
         'exclude' => parseCsvOption($options['exclude'] ?? ''),
     ];
+    $premiumPlugins = parseCsvOption($options['premium-plugins'] ?? '');
 
     $manualReview = manualReviewItems($policy);
     $notification = notifyManualReview($manualReview, $policy, $notifyEmail, array_key_exists('no-notify', $options));
@@ -91,7 +92,7 @@ function main(array $argv): void
 
     try {
         $lockHandle = acquireLock($lockFile);
-        $updates = plannedUpdates($policy, $mode, $filters);
+        $updates = plannedUpdates($policy, $mode, $filters, $premiumPlugins);
         $summary['updates'] = $updates;
 
         if ($apply && $updates !== []) {
@@ -151,6 +152,7 @@ Options:
   --plugins-only      Only consider plugins.
   --plugin=SLUG       Only consider one plugin slug.
   --exclude=SLUGS     Comma-separated plugin slugs to skip.
+  --premium-plugins=SLUGS Comma-separated plugin slugs to update without --version.
   --notify-email=ADDR Email for manual_review notifications.
   --no-notify         Disable manual_review email notifications.
   --lock-file=PATH    Optional lock file path.
@@ -201,7 +203,7 @@ function assertPolicyFresh(array $policy, int $maxAgeSeconds): void
     }
 }
 
-function plannedUpdates(array $policy, string $mode, array $filters): array
+function plannedUpdates(array $policy, string $mode, array $filters, array $premiumPlugins = []): array
 {
     $updates = [];
 
@@ -218,7 +220,7 @@ function plannedUpdates(array $policy, string $mode, array $filters): array
                 continue;
             }
 
-            $update = plannedAssetUpdate($plugin, $mode);
+            $update = plannedAssetUpdate($plugin, $mode, $premiumPlugins);
             if ($update !== null) {
                 $updates[] = $update;
             }
@@ -228,7 +230,7 @@ function plannedUpdates(array $policy, string $mode, array $filters): array
     return $updates;
 }
 
-function plannedAssetUpdate(array $asset, string $mode): ?array
+function plannedAssetUpdate(array $asset, string $mode, array $premiumPlugins = []): ?array
 {
     $action = (string) ($asset['recommended_action'] ?? 'hold');
     if ($action === 'manual_review' || $action === 'hold') {
@@ -258,13 +260,17 @@ function plannedAssetUpdate(array $asset, string $mode): ?array
         return null;
     }
 
+    $type = (string) ($asset['type'] ?? '');
+    $slug = (string) ($asset['slug'] ?? '');
+
     return [
-        'type' => (string) ($asset['type'] ?? ''),
-        'slug' => (string) ($asset['slug'] ?? ''),
+        'type' => $type,
+        'slug' => $slug,
         'name' => (string) ($asset['name'] ?? ''),
         'from_version' => (string) ($asset['current_version'] ?? ''),
         'to_version' => $target,
         'reason' => $reason,
+        'premium_plugin' => $type === 'plugin' && in_array($slug, $premiumPlugins, true),
         'status' => 'planned',
         'stdout' => null,
         'stderr' => null,
@@ -304,7 +310,10 @@ function applyUpdate(string $wpBinary, string $sitePath, array &$update, ?string
     if ($update['type'] === 'core') {
         $args = ['core', 'update', '--version=' . $update['to_version']];
     } elseif ($update['type'] === 'plugin') {
-        $args = ['plugin', 'update', $update['slug'], '--version=' . $update['to_version']];
+        $args = ['plugin', 'update', $update['slug']];
+        if (empty($update['premium_plugin'])) {
+            $args[] = '--version=' . $update['to_version'];
+        }
     } else {
         $update['status'] = 'skipped';
         $update['stderr'] = 'Unsupported update type.';
@@ -331,6 +340,8 @@ function applyUpdate(string $wpBinary, string $sitePath, array &$update, ?string
     if ($status !== 0) {
         throw new RuntimeException("Update failed for {$update['type']} {$update['slug']}: " . trim($stderr));
     }
+
+    verifyLiveVersionAfterUpdate($wpBinary, $sitePath, $update, $wpUser);
 }
 
 function verifyLiveVersionBeforeUpdate(string $wpBinary, string $sitePath, array &$update, ?string $wpUser): void
@@ -364,6 +375,23 @@ function liveAssetVersion(string $wpBinary, string $sitePath, string $type, stri
     }
 
     throw new RuntimeException("Unsupported update type: {$type}");
+}
+
+function verifyLiveVersionAfterUpdate(string $wpBinary, string $sitePath, array &$update, ?string $wpUser): void
+{
+    $liveVersion = liveAssetVersion($wpBinary, $sitePath, (string) $update['type'], (string) $update['slug'], $wpUser);
+    $update['installed_version'] = $liveVersion;
+
+    if (compareVersions($liveVersion, (string) $update['to_version']) < 0) {
+        $update['status'] = 'failed';
+        $update['stderr'] = trim((string) ($update['stderr'] ?? '') . "\nInstalled version {$liveVersion} is below policy target {$update['to_version']}.");
+        throw new RuntimeException("Update failed for {$update['type']} {$update['slug']}: installed version {$liveVersion} is below policy target {$update['to_version']}.");
+    }
+
+    if (!empty($update['premium_plugin']) && compareVersions($liveVersion, (string) $update['to_version']) > 0) {
+        $update['status'] = 'updated_beyond_policy';
+        $update['stderr'] = trim((string) ($update['stderr'] ?? '') . "\nPremium plugin updated beyond policy target {$update['to_version']} to {$liveVersion}.");
+    }
 }
 
 function updateLabel(array $update): string
