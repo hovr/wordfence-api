@@ -18,6 +18,7 @@ const DEFAULT_VERSIONS_TABLE = 'wp_update_versions';
 const DEFAULT_POLICY_DIR = 'policies';
 
 require_once __DIR__ . '/cli_helpers.php';
+require_once __DIR__ . '/email_helpers.php';
 
 if (realpath((string) ($_SERVER['SCRIPT_FILENAME'] ?? '')) === __FILE__) {
     main($argv);
@@ -838,13 +839,13 @@ function notifyPolicy(array $policy, string $outputPath, ?array $wordfenceRefres
     $subject = '[WordPress Update Policy] ' . (string) ($policy['site_key'] ?? 'site')
         . ' - ' . $summary;
     $body = policyEmailBody($policy, $outputPath, $wordfenceRefresh, $counts, $groups);
-    $headers = 'From: WordPress Update Policy <wordpress-updates@localhost>';
-    $sent = mail($email, $subject, $body, $headers);
+    $delivery = sendUpdaterEmail($email, $subject, $body);
 
     return [
-        'sent' => $sent,
+        'sent' => $delivery['sent'],
         'to' => $email,
-        'reason' => $sent ? null : 'mail_failed',
+        'reason' => $delivery['reason'] ?? null,
+        'transport' => $delivery['transport'] ?? null,
         'counts' => $counts,
     ];
 }

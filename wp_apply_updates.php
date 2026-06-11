@@ -10,6 +10,7 @@ declare(strict_types=1);
  */
 
 require_once __DIR__ . '/cli_helpers.php';
+require_once __DIR__ . '/email_helpers.php';
 
 main($argv);
 
@@ -464,13 +465,12 @@ function notifyManualReview(array $manualReview, array $policy, string $email, b
 
     $subject = '[WordPress Updates] Manual review required for ' . (string) ($policy['site_key'] ?? 'site');
     $body = manualReviewEmailBody($manualReview, $policy);
-    $headers = 'From: WordPress Update Policy <wordpress-updates@localhost>';
-
-    $sent = mail($email, $subject, $body, $headers);
+    $delivery = sendUpdaterEmail($email, $subject, $body);
     return [
-        'sent' => $sent,
+        'sent' => $delivery['sent'],
         'to' => $email,
-        'reason' => $sent ? null : 'mail_failed',
+        'reason' => $delivery['reason'] ?? null,
+        'transport' => $delivery['transport'] ?? null,
     ];
 }
 
