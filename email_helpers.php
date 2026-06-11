@@ -87,7 +87,7 @@ function sendUpdaterEmailWithMandrill(string $to, string $subject, string $body,
 
         $message['text'] = $body;
 
-        $result = $mandrill->messages->sendTemplate('general', [], $message, false, 'Main Pool', null);
+        $result = $mandrill->messages->sendTemplate('hfe-default', [], $message, false, 'Main Pool', null);
         $first = is_array($result) && isset($result[0]) && is_array($result[0]) ? $result[0] : [];
         $status = (string) ($first['status'] ?? '');
         $rejectReason = (string) ($first['reject_reason'] ?? '');
