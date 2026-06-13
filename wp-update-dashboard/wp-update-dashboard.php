@@ -29,6 +29,32 @@ function wpud_register_dashboard_widget(): void
         'WordPress Update Status',
         'wpud_render_dashboard_widget'
     );
+
+    wpud_place_dashboard_widget_after_site_health();
+}
+
+function wpud_place_dashboard_widget_after_site_health(): void
+{
+    global $wp_meta_boxes;
+
+    if (!isset($wp_meta_boxes['dashboard']['normal']['core']['dashboard_site_health'], $wp_meta_boxes['dashboard']['normal']['core']['wpud_update_dashboard'])) {
+        return;
+    }
+
+    $coreWidgets = $wp_meta_boxes['dashboard']['normal']['core'];
+    $updateWidget = $coreWidgets['wpud_update_dashboard'];
+    unset($coreWidgets['wpud_update_dashboard']);
+
+    $orderedWidgets = [];
+    foreach ($coreWidgets as $widgetId => $widget) {
+        $orderedWidgets[$widgetId] = $widget;
+
+        if ($widgetId === 'dashboard_site_health') {
+            $orderedWidgets['wpud_update_dashboard'] = $updateWidget;
+        }
+    }
+
+    $wp_meta_boxes['dashboard']['normal']['core'] = $orderedWidgets;
 }
 
 function wpud_enqueue_admin_styles(string $hook): void
