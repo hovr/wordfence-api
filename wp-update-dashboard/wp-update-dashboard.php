@@ -90,7 +90,7 @@ function wpud_load_status(): array
     if (!is_file($path)) {
         return [
             'ok' => false,
-            'message' => 'No update status file found yet. Check that the external update cron has written update-status.json.',
+            'message' => 'No updates available yet, if this continues for another day tell Matt!',
         ];
     }
 
