@@ -2,6 +2,8 @@ wp-config.php
 cache/
 policies/
 backups/
+wp-update-dashboard/update-status.json
+public/wp-content/plugins/wp-update-dashboard/update-status.json
 
 # Local agent/tool configuration
 .codex/

@@ -16,6 +16,8 @@ const DEFAULT_VULN_TABLE = 'wordfence_plugin_vulnerabilities';
 const DEFAULT_ASSETS_TABLE = 'wp_update_assets';
 const DEFAULT_VERSIONS_TABLE = 'wp_update_versions';
 const DEFAULT_POLICY_DIR = 'policies';
+const DEFAULT_DASHBOARD_PLUGIN = 'wp-update-dashboard';
+const DEFAULT_DASHBOARD_JSON = 'update-status.json';
 
 require_once __DIR__ . '/cli_helpers.php';
 require_once __DIR__ . '/email_helpers.php';
@@ -53,6 +55,7 @@ function main(array $argv): void
     $assetsTable = (string) ($options['assets-table'] ?? DEFAULT_ASSETS_TABLE);
     $versionsTable = (string) ($options['versions-table'] ?? DEFAULT_VERSIONS_TABLE);
     $output = (string) ($options['output'] ?? defaultPolicyPath($siteKey));
+    $dashboardOutput = (string) ($options['dashboard-json'] ?? defaultDashboardJsonPath($sitePath, (string) ($options['dashboard-plugin'] ?? DEFAULT_DASHBOARD_PLUGIN)));
     $refreshWordfence = array_key_exists('refresh-wordfence', $options);
     $ignoredVulnerabilities = parseIgnoredVulnerabilities($options['ignore-vuln'] ?? '');
 
@@ -88,7 +91,8 @@ function main(array $argv): void
         );
 
         writeJsonFile($output, $policy);
-        $notification = notifyPolicy($policy, $output, $wordfenceRefresh, $options);
+        $dashboardJson = writeDashboardJson($dashboardOutput, $policy, $wordfenceRefresh);
+        $notification = notifyPolicy($policy, $output, $wordfenceRefresh, $options, $dashboardJson);
     } catch (RuntimeException $exception) {
         fwrite(STDERR, $exception->getMessage() . "\n");
         exit(1);
@@ -98,6 +102,7 @@ function main(array $argv): void
         'site_key' => $siteKey,
         'site_path' => $sitePath,
         'output' => $output,
+        'dashboard_json' => $dashboardJson,
         'core_current_version' => $policy['core']['current_version'],
         'plugin_count' => count($policy['plugins']),
         'generated_at' => $policy['generated_at'],
@@ -123,6 +128,8 @@ Options:
   --normal-days=N        Backward-compatible alias. Converted to hours.
   --emergency-days=N     Backward-compatible alias. Converted to hours.
   --output=PATH          Optional policy JSON output path.
+  --dashboard-json=PATH  Optional dashboard JSON path. Default: SITE/wp-content/plugins/wp-update-dashboard/update-status.json.
+  --dashboard-plugin=DIR Optional dashboard plugin folder name. Default: wp-update-dashboard.
   --policy-settings=PATH Optional JSON settings file for policy generation options.
   --notify-email=ADDR    Optional. Email policy summary after generation.
   --no-notify            Optional. Disable policy email notification.
@@ -789,6 +796,16 @@ function defaultPolicyPath(string $siteKey): string
     return __DIR__ . '/' . DEFAULT_POLICY_DIR . '/' . preg_replace('/[^A-Za-z0-9_.-]+/', '-', $siteKey) . '.json';
 }
 
+function defaultDashboardJsonPath(string $sitePath, string $pluginDirectory): string
+{
+    $pluginDirectory = preg_replace('/[^A-Za-z0-9_.-]+/', '-', $pluginDirectory) ?: DEFAULT_DASHBOARD_PLUGIN;
+    return rtrim($sitePath, DIRECTORY_SEPARATOR)
+        . '/wp-content/plugins/'
+        . $pluginDirectory
+        . '/'
+        . DEFAULT_DASHBOARD_JSON;
+}
+
 function writeJsonFile(string $path, array $data): void
 {
     $directory = dirname($path);
@@ -814,7 +831,73 @@ function writeJsonFile(string $path, array $data): void
     }
 }
 
-function notifyPolicy(array $policy, string $outputPath, ?array $wordfenceRefresh, array $options): array
+function writeDashboardJson(string $path, array $policy, ?array $wordfenceRefresh): array
+{
+    $directory = dirname($path);
+    if (!is_dir($directory)) {
+        return [
+            'written' => false,
+            'path' => $path,
+            'reason' => 'missing_plugin_directory',
+            'message' => "Dashboard JSON was not written because the plugin directory does not exist: {$directory}",
+        ];
+    }
+
+    if (!is_writable($directory)) {
+        return [
+            'written' => false,
+            'path' => $path,
+            'reason' => 'plugin_directory_not_writable',
+            'message' => "Dashboard JSON was not written because the plugin directory is not writable: {$directory}",
+        ];
+    }
+
+    try {
+        writeJsonFile($path, dashboardStatusForPolicy($policy, $wordfenceRefresh));
+    } catch (RuntimeException $exception) {
+        return [
+            'written' => false,
+            'path' => $path,
+            'reason' => 'write_failed',
+            'message' => 'Dashboard JSON could not be written: ' . $exception->getMessage(),
+        ];
+    }
+
+    return [
+        'written' => true,
+        'path' => $path,
+        'reason' => null,
+        'message' => 'Dashboard JSON written.',
+    ];
+}
+
+function dashboardStatusForPolicy(array $policy, ?array $wordfenceRefresh): array
+{
+    $counts = policyActionCounts($policy);
+    $groups = policyUpdateEmailGroupsForPolicy($policy);
+    $summary = policySubjectSummary($counts, $groups);
+
+    return [
+        'schema_version' => 1,
+        'generated_at' => (string) ($policy['generated_at'] ?? ''),
+        'site_key' => (string) ($policy['site_key'] ?? ''),
+        'site_path' => (string) ($policy['site_path'] ?? ''),
+        'summary' => $summary,
+        'counts' => [
+            'normal_update' => (int) ($counts['normal_update'] ?? 0),
+            'emergency_update' => (int) ($counts['emergency_update'] ?? 0),
+            'manual_review' => (int) ($counts['manual_review'] ?? 0),
+            'hold' => (int) ($counts['hold'] ?? 0),
+            'emergency_waiting' => count($groups['emergency_waiting'] ?? []),
+            'normal_waiting' => count($groups['normal_waiting'] ?? []),
+        ],
+        'groups' => $groups,
+        'rules' => is_array($policy['rules'] ?? null) ? $policy['rules'] : [],
+        'wordfence_refresh' => $wordfenceRefresh,
+    ];
+}
+
+function notifyPolicy(array $policy, string $outputPath, ?array $wordfenceRefresh, array $options, ?array $dashboardJson = null): array
 {
     if (array_key_exists('no-notify', $options)) {
         return ['sent' => false, 'reason' => 'disabled'];
@@ -838,7 +921,7 @@ function notifyPolicy(array $policy, string $outputPath, ?array $wordfenceRefres
 
     $subject = '[WordPress Update Policy] ' . (string) ($policy['site_key'] ?? 'site')
         . ' - ' . $summary;
-    $body = policyEmailBody($policy, $outputPath, $wordfenceRefresh, $counts, $groups);
+    $body = policyEmailBody($policy, $outputPath, $wordfenceRefresh, $counts, $groups, $dashboardJson);
     $delivery = sendUpdaterEmail($email, $subject, $body);
 
     return [
@@ -915,7 +998,7 @@ function policySubjectSummary(array $counts, array $groups = []): string
     return 'no updates';
 }
 
-function policyEmailBody(array $policy, string $outputPath, ?array $wordfenceRefresh, array $counts, ?array $groups = null): string
+function policyEmailBody(array $policy, string $outputPath, ?array $wordfenceRefresh, array $counts, ?array $groups = null, ?array $dashboardJson = null): string
 {
     $rules = is_array($policy['rules'] ?? null) ? $policy['rules'] : [];
     $lines = [
@@ -937,6 +1020,17 @@ function policyEmailBody(array $policy, string $outputPath, ?array $wordfenceRef
         '  Hold: ' . (string) ($counts['hold'] ?? 0),
         '',
     ];
+
+    if ($dashboardJson !== null) {
+        $lines[] = 'Dashboard JSON:';
+        $lines[] = '  Status: ' . (!empty($dashboardJson['written']) ? 'written' : 'not written');
+        $lines[] = '  Path: ' . (string) ($dashboardJson['path'] ?? '');
+        if (empty($dashboardJson['written'])) {
+            $lines[] = '  Reason: ' . (string) ($dashboardJson['reason'] ?? 'unknown');
+            $lines[] = '  Message: ' . (string) ($dashboardJson['message'] ?? 'Dashboard JSON could not be written.');
+        }
+        $lines[] = '';
+    }
 
     if ($wordfenceRefresh !== null) {
         $lines[] = 'Wordfence refresh:';

@@ -1,0 +1,7 @@
+<Files "update-status.json">
+    Require all denied
+</Files>
+
+<Files ".htaccess">
+    Require all denied
+</Files>
