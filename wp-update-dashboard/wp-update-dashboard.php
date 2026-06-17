@@ -101,9 +101,9 @@ function wpud_render_dashboard_widget(): void
     wpud_render_count('Pending', (int) ($counts['emergency_waiting'] ?? 0) + (int) ($counts['normal_waiting'] ?? 0), 'muted');
     echo '</div>';
 
-    wpud_render_group('Emergency updates', $groups['emergency_action'] ?? []);
+    wpud_render_group('Will update on the next emergency run', $groups['emergency_action'] ?? []);
     wpud_render_group('Emergency pending', $groups['emergency_waiting'] ?? []);
-    wpud_render_group('Normal updates', $groups['normal_action'] ?? []);
+    wpud_render_group('Will update on the next normal run', $groups['normal_action'] ?? []);
     wpud_render_group('Normal pending', $groups['normal_waiting'] ?? []);
     wpud_render_group('Manual review', $groups['manual_review'] ?? []);
 
@@ -185,10 +185,98 @@ function wpud_render_group(string $heading, $items): void
         if (!empty($item['note'])) {
             echo '<em>' . esc_html((string) $item['note']) . '</em>';
         }
+        wpud_render_vulnerabilities($item);
         echo '</li>';
     }
     echo '</ul>';
     echo '</div>';
+}
+
+function wpud_render_vulnerabilities(array $item): void
+{
+    $vulnerabilities = $item['vulnerabilities'] ?? [];
+    if (!is_array($vulnerabilities) || $vulnerabilities === []) {
+        return;
+    }
+
+    echo '<div class="wpud-vulnerabilities">';
+    foreach ($vulnerabilities as $vulnerability) {
+        if (!is_array($vulnerability)) {
+            continue;
+        }
+
+        echo '<div class="wpud-vulnerability">';
+        echo '<span>' . esc_html(wpud_vulnerability_label($vulnerability)) . '</span>';
+        wpud_render_reference_links($vulnerability['references'] ?? []);
+        echo '</div>';
+    }
+    echo '</div>';
+}
+
+function wpud_vulnerability_label(array $vulnerability): string
+{
+    $parts = [];
+    $cve = (string) ($vulnerability['cve'] ?? '');
+    if ($cve !== '') {
+        $parts[] = $cve;
+    }
+
+    $title = (string) ($vulnerability['title'] ?? '');
+    if ($title !== '') {
+        $parts[] = $title;
+    }
+
+    $cvss = wpud_cvss_label($vulnerability);
+    if ($cvss !== '') {
+        $parts[] = $cvss;
+    }
+
+    return implode(' - ', $parts);
+}
+
+function wpud_cvss_label(array $vulnerability): string
+{
+    $rating = (string) ($vulnerability['cvss_rating'] ?? '');
+    $score = $vulnerability['cvss_score'] ?? null;
+
+    if ($rating === '' && ($score === null || $score === '')) {
+        return '';
+    }
+
+    if ($rating !== '' && $score !== null && $score !== '') {
+        return 'CVSS ' . $rating . ' ' . (string) $score;
+    }
+
+    return $rating !== '' ? 'CVSS ' . $rating : 'CVSS ' . (string) $score;
+}
+
+function wpud_render_reference_links($references): void
+{
+    if (!is_array($references) || $references === []) {
+        return;
+    }
+
+    echo '<span class="wpud-references">';
+    foreach ($references as $index => $reference) {
+        if (!is_array($reference)) {
+            continue;
+        }
+
+        $url = (string) ($reference['url'] ?? '');
+        if ($url === '') {
+            continue;
+        }
+
+        if ((int) $index > 0) {
+            echo ' ';
+        }
+
+        $label = (string) ($reference['label'] ?? '');
+        echo '<a href="' . esc_url($url) . '" target="_blank" rel="noopener noreferrer">'
+            . esc_html($label !== '' ? $label : 'Info')
+            . '</a>';
+    }
+    echo '</span>';
 }
 
 function wpud_item_version_text(array $item): string
@@ -251,6 +339,10 @@ function wpud_admin_css(): string
         .wpud-group li strong { overflow-wrap: anywhere; }
         .wpud-group li span { color: #50575e; white-space: nowrap; }
         .wpud-group li em { grid-column: 1 / -1; color: #646970; font-style: normal; }
+        .wpud-vulnerabilities { grid-column: 1 / -1; display: grid; gap: 4px; color: #646970; font-size: 12px; }
+        .wpud-vulnerability { display: flex; flex-wrap: wrap; gap: 6px; align-items: baseline; }
+        .wpud-vulnerability span { white-space: normal; }
+        .wpud-references { display: inline-flex; flex-wrap: wrap; gap: 6px; }
         @media (max-width: 782px) {
             .wpud-counts { grid-template-columns: repeat(2, minmax(0, 1fr)); }
             .wpud-summary { display: block; }

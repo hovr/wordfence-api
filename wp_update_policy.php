@@ -652,7 +652,7 @@ function safeObservedVersions(array $vulnerabilityRows, array $observedVersions,
 function loadVulnerabilitiesForAsset(DB $db, string $vulnTable, string $assetType, string $slug): array
 {
     $result = $db->query("
-        SELECT `vulnerability_id`, `title`, `cve`, `cvss_score`, `cvss_rating`, `affected_versions_json`, `patched_versions_json`, `remediation`
+        SELECT `vulnerability_id`, `title`, `cve`, `cvss_score`, `cvss_rating`, `affected_versions_json`, `patched_versions_json`, `remediation`, `references_json`
         FROM `{$vulnTable}`
         WHERE `software_type` = " . sqlString($db, $assetType) . "
           AND `software_slug` = " . sqlString($db, $slug) . "
@@ -667,6 +667,7 @@ function loadVulnerabilitiesForAsset(DB $db, string $vulnTable, string $assetTyp
             'cve' => $row['cve'] !== null ? (string) $row['cve'] : null,
             'cvss_score' => $row['cvss_score'] !== null ? (float) $row['cvss_score'] : null,
             'cvss_rating' => $row['cvss_rating'] !== null ? (string) $row['cvss_rating'] : null,
+            'references' => normalizeVulnerabilityReferences(json_decode((string) $row['references_json'], true) ?: []),
             'affected_versions' => is_array($ranges) ? $ranges : [],
             'patched_versions' => json_decode((string) $row['patched_versions_json'], true) ?: [],
             'remediation' => $row['remediation'] !== null ? (string) $row['remediation'] : null,
@@ -691,6 +692,55 @@ function findVulnerabilitiesForVersion(array $vulnerabilityRows, string $version
     }
 
     return $vulnerabilities;
+}
+
+function normalizeVulnerabilityReferences(array $references): array
+{
+    $links = [];
+    foreach (['url', 'link', 'href'] as $field) {
+        if (!empty($references[$field]) && is_string($references[$field])) {
+            $references = [$references];
+            break;
+        }
+    }
+
+    foreach ($references as $key => $reference) {
+        $url = '';
+        $label = '';
+
+        if (is_string($reference)) {
+            $url = $reference;
+        } elseif (is_array($reference)) {
+            foreach (['url', 'link', 'href'] as $field) {
+                if (!empty($reference[$field]) && is_string($reference[$field])) {
+                    $url = $reference[$field];
+                    break;
+                }
+            }
+
+            foreach (['label', 'title', 'source'] as $field) {
+                if (!empty($reference[$field]) && is_string($reference[$field])) {
+                    $label = $reference[$field];
+                    break;
+                }
+            }
+        }
+
+        if ($url === '' || !preg_match('/^https?:\/\//i', $url)) {
+            continue;
+        }
+
+        if ($label === '' && is_string($key) && !is_numeric($key)) {
+            $label = $key;
+        }
+
+        $links[] = [
+            'url' => $url,
+            'label' => $label !== '' ? $label : $url,
+        ];
+    }
+
+    return $links;
 }
 
 function versionMatchesAffectedRanges(string $version, array $ranges): bool
@@ -1240,7 +1290,30 @@ function policyEmailAssetSummary(array $asset, ?string $targetVersion, string $a
         'target_version' => $targetVersion,
         'action' => $action,
         'note' => $note,
+        'vulnerabilities' => policyAssetVulnerabilitySummaries($asset),
     ];
+}
+
+function policyAssetVulnerabilitySummaries(array $asset): array
+{
+    $summaries = [];
+
+    foreach (($asset['current_vulnerabilities'] ?? []) as $vulnerability) {
+        if (!is_array($vulnerability)) {
+            continue;
+        }
+
+        $summaries[] = [
+            'id' => (string) ($vulnerability['id'] ?? ''),
+            'title' => (string) ($vulnerability['title'] ?? ''),
+            'cve' => $vulnerability['cve'] ?? null,
+            'cvss_score' => $vulnerability['cvss_score'] ?? null,
+            'cvss_rating' => $vulnerability['cvss_rating'] ?? null,
+            'references' => is_array($vulnerability['references'] ?? null) ? $vulnerability['references'] : [],
+        ];
+    }
+
+    return $summaries;
 }
 
 function policyEmailAssetLine(array $asset): string

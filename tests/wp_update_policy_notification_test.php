@@ -83,6 +83,21 @@ assertSameValue(1, count($manualReviewGroups['manual_review']), 'Manual-review a
 assertSameValue(0, count($manualReviewGroups['emergency_waiting']), 'Unsafe waiting updates should not be shown as emergency waiting updates.');
 
 $vulnerableWaitingPolicy = $manualReviewPolicy;
+$vulnerableWaitingPolicy['core']['current_vulnerabilities'] = [
+    [
+        'id' => 'wf-test-1',
+        'title' => 'Test vulnerable range',
+        'cve' => 'CVE-2026-1234',
+        'cvss_score' => 8.1,
+        'cvss_rating' => 'High',
+        'references' => [
+            [
+                'url' => 'https://www.wordfence.com/threat-intel/vulnerabilities/id/wf-test-1',
+                'label' => 'Wordfence',
+            ],
+        ],
+    ],
+];
 $vulnerableWaitingPolicy['core']['safe_observed_versions'] = [
     [
         'version' => '2.1.0',
@@ -95,6 +110,19 @@ $vulnerableWaitingGroups = policyUpdateEmailGroupsForPolicy($vulnerableWaitingPo
 assertSameValue(1, count($vulnerableWaitingGroups['emergency_waiting']), 'Safe emergency updates within delay should appear in the waiting group.');
 assertSameValue(1, count($vulnerableWaitingGroups['manual_review']), 'Vulnerable assets should remain in manual review while a safe update is still waiting.');
 assertSameValue('1 manual review', policySubjectSummary(policyActionCounts($vulnerableWaitingPolicy), $vulnerableWaitingGroups), 'Manual-review subject should stay consistent for vulnerable waiting assets.');
+assertSameValue(8.1, $vulnerableWaitingGroups['emergency_waiting'][0]['vulnerabilities'][0]['cvss_score'], 'Emergency dashboard summaries should include the vulnerability CVSS score.');
+assertSameValue('High', $vulnerableWaitingGroups['emergency_waiting'][0]['vulnerabilities'][0]['cvss_rating'], 'Emergency dashboard summaries should include the vulnerability CVSS rating.');
+assertSameValue('https://www.wordfence.com/threat-intel/vulnerabilities/id/wf-test-1', $vulnerableWaitingGroups['emergency_waiting'][0]['vulnerabilities'][0]['references'][0]['url'], 'Emergency dashboard summaries should include Wordfence reference links.');
+
+$normalizedReferences = normalizeVulnerabilityReferences([
+    'Wordfence' => 'https://www.wordfence.com/threat-intel/vulnerabilities/id/wf-test-1',
+    ['url' => 'https://example.com/advisory', 'title' => 'Advisory'],
+    'javascript:alert(1)',
+]);
+assertSameValue(2, count($normalizedReferences), 'Reference normalization should keep only HTTP links.');
+assertSameValue('Wordfence', $normalizedReferences[0]['label'], 'Reference normalization should use associative labels when available.');
+$singleReference = normalizeVulnerabilityReferences(['url' => 'https://www.wordfence.com/example', 'label' => 'Wordfence details']);
+assertSameValue('Wordfence details', $singleReference[0]['label'], 'Reference normalization should preserve labels from a single reference object.');
 
 $waitingPolicy = [
     'site_key' => 'example-site',
