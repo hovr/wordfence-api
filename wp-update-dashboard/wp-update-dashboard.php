@@ -231,7 +231,17 @@ function wpud_vulnerability_label(array $vulnerability): string
         $parts[] = $cvss;
     }
 
-    return implode(' - ', $parts);
+    $label = implode(' - ', $parts);
+    if ($label !== '') {
+        return $label;
+    }
+
+    $id = (string) ($vulnerability['id'] ?? '');
+    if ($id !== '') {
+        return $id;
+    }
+
+    return 'Vulnerability details';
 }
 
 function wpud_cvss_label(array $vulnerability): string
