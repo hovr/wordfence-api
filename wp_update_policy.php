@@ -829,6 +829,18 @@ function writeJsonFile(string $path, array $data): void
         @unlink($tmpFile);
         throw new RuntimeException("Unable to move temporary policy file into place: {$path}");
     }
+
+    if (!@chown($path, 'deploy')) {
+        throw new RuntimeException("Unable to set JSON file owner to deploy: {$path}");
+    }
+
+    if (!@chgrp($path, 'www-data')) {
+        throw new RuntimeException("Unable to set JSON file group to www-data: {$path}");
+    }
+
+    if (!@chmod($path, 0644)) {
+        throw new RuntimeException("Unable to set JSON file permissions to 0644: {$path}");
+    }
 }
 
 function writeDashboardJson(string $path, array $policy, ?array $wordfenceRefresh): array
