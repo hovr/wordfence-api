@@ -661,13 +661,15 @@ function loadVulnerabilitiesForAsset(DB $db, string $vulnTable, string $assetTyp
     $vulnerabilities = [];
     while ($row = mysqli_fetch_assoc($result)) {
         $ranges = json_decode((string) $row['affected_versions_json'], true);
+        $decodedReferences = json_decode((string) $row['references_json'], true);
+        $references = is_array($decodedReferences) ? normalizeVulnerabilityReferences($decodedReferences) : [];
         $vulnerabilities[] = [
             'id' => (string) $row['vulnerability_id'],
             'title' => (string) $row['title'],
             'cve' => $row['cve'] !== null ? (string) $row['cve'] : null,
             'cvss_score' => $row['cvss_score'] !== null ? (float) $row['cvss_score'] : null,
             'cvss_rating' => $row['cvss_rating'] !== null ? (string) $row['cvss_rating'] : null,
-            'references' => normalizeVulnerabilityReferences(json_decode((string) $row['references_json'], true) ?: []),
+            'references' => $references,
             'affected_versions' => is_array($ranges) ? $ranges : [],
             'patched_versions' => json_decode((string) $row['patched_versions_json'], true) ?: [],
             'remediation' => $row['remediation'] !== null ? (string) $row['remediation'] : null,
