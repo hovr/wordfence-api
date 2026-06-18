@@ -12,7 +12,9 @@ declare(strict_types=1);
 require_once __DIR__ . '/cli_helpers.php';
 require_once __DIR__ . '/email_helpers.php';
 
-main($argv);
+if (realpath((string) ($_SERVER['SCRIPT_FILENAME'] ?? '')) === __FILE__) {
+    main($argv);
+}
 
 function main(array $argv): void
 {
@@ -108,7 +110,13 @@ function main(array $argv): void
             }
 
             foreach ($summary['updates'] as &$update) {
-                applyUpdate($wpBinary, $sitePath, $update, $wpUser);
+                applyUpdate(
+                    $wpBinary,
+                    $sitePath,
+                    $update,
+                    $wpUser,
+                    (string) ($options['plugin-backup-dir'] ?? __DIR__ . '/plugin-backups')
+                );
             }
             unset($update);
         }
@@ -148,6 +156,7 @@ Options:
   --policy-settings=PATH Optional JSON settings file for apply options.
   --backup-db         Export database before applying updates.
   --backup-dir=PATH   Optional backup directory. Default: ./backups.
+  --plugin-backup-dir=PATH Optional plugin file backup directory. Default: ./plugin-backups.
   --maintenance       Activate maintenance mode while applying updates.
   --core-only         Only consider WordPress core.
   --plugins-only      Only consider plugins.
@@ -306,8 +315,10 @@ function passesPluginFilters(array $plugin, array $filters): bool
     return !in_array($slug, $filters['exclude'], true);
 }
 
-function applyUpdate(string $wpBinary, string $sitePath, array &$update, ?string $wpUser): void
+function applyUpdate(string $wpBinary, string $sitePath, array &$update, ?string $wpUser, string $pluginBackupDir): void
 {
+    $pluginBackup = null;
+
     if ($update['type'] === 'core') {
         $args = ['core', 'update', '--version=' . $update['to_version']];
     } elseif ($update['type'] === 'plugin') {
@@ -333,16 +344,27 @@ function applyUpdate(string $wpBinary, string $sitePath, array &$update, ?string
         return;
     }
 
+    if ($update['type'] === 'plugin') {
+        $pluginBackup = backupPluginDirectory($sitePath, (string) $update['slug'], $pluginBackupDir);
+        $update['plugin_backup'] = $pluginBackup;
+    }
+
     $stdout = runWp($wpBinary, $sitePath, $args, true, $wpUser, $stderr, $status);
     $update['stdout'] = trim($stdout);
     $update['stderr'] = trim((string) $stderr);
     $update['status'] = $status === 0 ? 'updated' : 'failed';
 
     if ($status !== 0) {
+        restorePluginBackupAfterFailure($sitePath, $update, $pluginBackup);
         throw new RuntimeException("Update failed for {$update['type']} {$update['slug']}: " . trim($stderr));
     }
 
-    verifyLiveVersionAfterUpdate($wpBinary, $sitePath, $update, $wpUser);
+    try {
+        verifyLiveVersionAfterUpdate($wpBinary, $sitePath, $update, $wpUser);
+    } catch (RuntimeException $exception) {
+        restorePluginBackupAfterFailure($sitePath, $update, $pluginBackup);
+        throw $exception;
+    }
 }
 
 function verifyLiveVersionBeforeUpdate(string $wpBinary, string $sitePath, array &$update, ?string $wpUser): void
@@ -419,6 +441,142 @@ function backupDatabase(string $wpBinary, string $sitePath, string $siteKey, str
         'path' => $backupPath,
         'stdout' => trim($stdout),
     ];
+}
+
+function backupPluginDirectory(string $sitePath, string $slug, string $backupRoot): array
+{
+    $pluginPath = pluginDirectoryPath($sitePath, $slug);
+    if (!is_dir($pluginPath)) {
+        throw new RuntimeException("Plugin directory does not exist before update: {$pluginPath}");
+    }
+
+    ensureDirectory($backupRoot);
+
+    $backupPath = $backupRoot
+        . DIRECTORY_SEPARATOR
+        . safeFileName(basename($sitePath)) . '-'
+        . safeFileName($slug) . '-'
+        . gmdate('Ymd-His') . '-'
+        . bin2hex(random_bytes(4));
+
+    copyDirectory($pluginPath, $backupPath);
+
+    return [
+        'source' => $pluginPath,
+        'path' => $backupPath,
+    ];
+}
+
+function restorePluginBackupAfterFailure(string $sitePath, array &$update, ?array $pluginBackup): void
+{
+    if ($pluginBackup === null || ($update['type'] ?? null) !== 'plugin') {
+        return;
+    }
+
+    $pluginPath = pluginDirectoryPath($sitePath, (string) $update['slug']);
+    $backupPath = (string) ($pluginBackup['path'] ?? '');
+    if ($backupPath === '' || !is_dir($backupPath)) {
+        $update['plugin_restore'] = [
+            'status' => 'failed',
+            'stderr' => 'Plugin backup path is missing.',
+        ];
+        return;
+    }
+
+    try {
+        if (is_dir($pluginPath)) {
+            removeDirectory($pluginPath);
+        }
+
+        copyDirectory($backupPath, $pluginPath);
+        $update['plugin_restore'] = [
+            'status' => 'restored',
+            'path' => $pluginPath,
+            'backup' => $backupPath,
+        ];
+        $update['stderr'] = trim((string) ($update['stderr'] ?? '') . "\nRestored plugin files from backup after failed update.");
+    } catch (RuntimeException $exception) {
+        $update['plugin_restore'] = [
+            'status' => 'failed',
+            'stderr' => $exception->getMessage(),
+            'backup' => $backupPath,
+        ];
+        $update['stderr'] = trim((string) ($update['stderr'] ?? '') . "\nPlugin file restore failed: " . $exception->getMessage());
+    }
+}
+
+function pluginDirectoryPath(string $sitePath, string $slug): string
+{
+    return rtrim($sitePath, DIRECTORY_SEPARATOR) . DIRECTORY_SEPARATOR . 'wp-content' . DIRECTORY_SEPARATOR . 'plugins' . DIRECTORY_SEPARATOR . $slug;
+}
+
+function copyDirectory(string $source, string $destination): void
+{
+    if (!is_dir($source)) {
+        throw new RuntimeException("Source directory does not exist: {$source}");
+    }
+
+    if (file_exists($destination)) {
+        throw new RuntimeException("Destination already exists: {$destination}");
+    }
+
+    ensureDirectory($destination);
+
+    $iterator = new RecursiveIteratorIterator(
+        new RecursiveDirectoryIterator($source, FilesystemIterator::SKIP_DOTS),
+        RecursiveIteratorIterator::SELF_FIRST
+    );
+
+    foreach ($iterator as $item) {
+        $target = $destination . DIRECTORY_SEPARATOR . $iterator->getSubPathName();
+        if ($item->isLink()) {
+            $linkTarget = readlink($item->getPathname());
+            if ($linkTarget === false || !symlink($linkTarget, $target)) {
+                throw new RuntimeException("Unable to copy symlink: {$item->getPathname()}");
+            }
+            continue;
+        }
+
+        if ($item->isDir()) {
+            ensureDirectory($target);
+            continue;
+        }
+
+        if (!copy($item->getPathname(), $target)) {
+            throw new RuntimeException("Unable to copy file: {$item->getPathname()}");
+        }
+
+        chmod($target, $item->getPerms() & 0777);
+    }
+}
+
+function removeDirectory(string $directory): void
+{
+    if (!is_dir($directory)) {
+        return;
+    }
+
+    $iterator = new RecursiveIteratorIterator(
+        new RecursiveDirectoryIterator($directory, FilesystemIterator::SKIP_DOTS),
+        RecursiveIteratorIterator::CHILD_FIRST
+    );
+
+    foreach ($iterator as $item) {
+        if ($item->isDir() && !$item->isLink()) {
+            if (!rmdir($item->getPathname())) {
+                throw new RuntimeException("Unable to remove directory: {$item->getPathname()}");
+            }
+            continue;
+        }
+
+        if (!unlink($item->getPathname())) {
+            throw new RuntimeException("Unable to remove file: {$item->getPathname()}");
+        }
+    }
+
+    if (!rmdir($directory)) {
+        throw new RuntimeException("Unable to remove directory: {$directory}");
+    }
 }
 
 function manualReviewItems(array $policy): array
