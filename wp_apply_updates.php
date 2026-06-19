@@ -115,7 +115,7 @@ function main(array $argv): void
                     $sitePath,
                     $update,
                     $wpUser,
-                    (string) ($options['plugin-backup-dir'] ?? __DIR__ . '/plugin-backups')
+                    (string) ($options['plugin-backup-dir'] ?? defaultPluginBackupRoot($sitePath))
                 );
             }
             unset($update);
@@ -356,14 +356,16 @@ function applyUpdate(string $wpBinary, string $sitePath, array &$update, ?string
 
     if ($status !== 0) {
         restorePluginBackupAfterFailure($sitePath, $update, $pluginBackup);
-        throw new RuntimeException("Update failed for {$update['type']} {$update['slug']}: " . trim($stderr));
+        $message = "Update failed for {$update['type']} {$update['slug']}: " . trim($stderr);
+        throw new RuntimeException(appendRestoreFailureMessage($message, $update));
     }
 
     try {
         verifyLiveVersionAfterUpdate($wpBinary, $sitePath, $update, $wpUser);
     } catch (RuntimeException $exception) {
         restorePluginBackupAfterFailure($sitePath, $update, $pluginBackup);
-        throw $exception;
+        $message = appendRestoreFailureMessage($exception->getMessage(), $update);
+        throw new RuntimeException($message, 0, $exception);
     }
 }
 
@@ -445,25 +447,37 @@ function backupDatabase(string $wpBinary, string $sitePath, string $siteKey, str
 
 function backupPluginDirectory(string $sitePath, string $slug, string $backupRoot): array
 {
-    $pluginPath = pluginDirectoryPath($sitePath, $slug);
-    if (!is_dir($pluginPath)) {
-        throw new RuntimeException("Plugin directory does not exist before update: {$pluginPath}");
+    $pluginPath = pluginPathFromSlug($sitePath, $slug);
+    if (!file_exists($pluginPath) && !is_link($pluginPath)) {
+        throw new RuntimeException("Plugin path does not exist before update: {$pluginPath}");
     }
 
-    ensureDirectory($backupRoot);
+    $pluginsDir = pluginBaseDirectory($sitePath);
+    $sourcePath = normalizedAbsolutePath($pluginPath);
+    $backupRootPath = normalizedAbsolutePath($backupRoot);
+    if (pathIsWithin($backupRootPath, $pluginsDir)) {
+        throw new RuntimeException('Plugin backup directory must be outside wp-content/plugins.');
+    }
 
-    $backupPath = $backupRoot
+    if (pathIsWithin($backupRootPath, $sourcePath)) {
+        throw new RuntimeException('Plugin backup directory must not be inside the plugin being backed up.');
+    }
+
+    ensurePrivateDirectory($backupRootPath);
+
+    $backupPath = $backupRootPath
         . DIRECTORY_SEPARATOR
         . safeFileName(basename($sitePath)) . '-'
         . safeFileName($slug) . '-'
         . gmdate('Ymd-His') . '-'
         . bin2hex(random_bytes(4));
 
-    copyDirectory($pluginPath, $backupPath);
+    copyPath($pluginPath, $backupPath);
 
     return [
         'source' => $pluginPath,
         'path' => $backupPath,
+        'kind' => is_dir($pluginPath) && !is_link($pluginPath) ? 'directory' : 'file',
     ];
 }
 
@@ -473,9 +487,9 @@ function restorePluginBackupAfterFailure(string $sitePath, array &$update, ?arra
         return;
     }
 
-    $pluginPath = pluginDirectoryPath($sitePath, (string) $update['slug']);
+    $pluginPath = pluginPathFromSlug($sitePath, (string) $update['slug']);
     $backupPath = (string) ($pluginBackup['path'] ?? '');
-    if ($backupPath === '' || !is_dir($backupPath)) {
+    if ($backupPath === '' || (!file_exists($backupPath) && !is_link($backupPath))) {
         $update['plugin_restore'] = [
             'status' => 'failed',
             'stderr' => 'Plugin backup path is missing.',
@@ -483,12 +497,35 @@ function restorePluginBackupAfterFailure(string $sitePath, array &$update, ?arra
         return;
     }
 
+    $restoreParent = dirname($pluginPath);
+    $restoreTemp = $restoreParent
+        . DIRECTORY_SEPARATOR
+        . '.restore-' . safeFileName(basename($pluginPath)) . '-' . bin2hex(random_bytes(4));
+    $failedPath = null;
+
     try {
-        if (is_dir($pluginPath)) {
-            removeDirectory($pluginPath);
+        ensureDirectory($restoreParent);
+        copyPath($backupPath, $restoreTemp);
+
+        if (file_exists($pluginPath) || is_link($pluginPath)) {
+            $failedPath = $pluginPath . '.failed-' . gmdate('Ymd-His') . '-' . bin2hex(random_bytes(4));
+            if (!rename($pluginPath, $failedPath)) {
+                throw new RuntimeException("Unable to quarantine failed plugin path: {$pluginPath}");
+            }
         }
 
-        copyDirectory($backupPath, $pluginPath);
+        if (!rename($restoreTemp, $pluginPath)) {
+            if ($failedPath !== null && (file_exists($failedPath) || is_link($failedPath)) && !file_exists($pluginPath)) {
+                rename($failedPath, $pluginPath);
+                $failedPath = null;
+            }
+            throw new RuntimeException("Unable to move restored plugin backup into place: {$pluginPath}");
+        }
+
+        if ($failedPath !== null) {
+            removePath($failedPath);
+        }
+
         $update['plugin_restore'] = [
             'status' => 'restored',
             'path' => $pluginPath,
@@ -496,6 +533,10 @@ function restorePluginBackupAfterFailure(string $sitePath, array &$update, ?arra
         ];
         $update['stderr'] = trim((string) ($update['stderr'] ?? '') . "\nRestored plugin files from backup after failed update.");
     } catch (RuntimeException $exception) {
+        if (file_exists($restoreTemp) || is_link($restoreTemp)) {
+            removePath($restoreTemp);
+        }
+
         $update['plugin_restore'] = [
             'status' => 'failed',
             'stderr' => $exception->getMessage(),
@@ -505,22 +546,121 @@ function restorePluginBackupAfterFailure(string $sitePath, array &$update, ?arra
     }
 }
 
+function appendRestoreFailureMessage(string $message, array $update): string
+{
+    $restore = $update['plugin_restore'] ?? null;
+    if (!is_array($restore) || ($restore['status'] ?? null) !== 'failed') {
+        return $message;
+    }
+
+    return trim($message . "\nPlugin restore failed: " . (string) ($restore['stderr'] ?? 'Unknown restore failure.'));
+}
+
+function defaultPluginBackupRoot(string $sitePath): string
+{
+    return rtrim(sys_get_temp_dir(), DIRECTORY_SEPARATOR)
+        . DIRECTORY_SEPARATOR
+        . 'wp-update-plugin-backups'
+        . DIRECTORY_SEPARATOR
+        . safeFileName(basename($sitePath));
+}
+
 function pluginDirectoryPath(string $sitePath, string $slug): string
 {
-    return rtrim($sitePath, DIRECTORY_SEPARATOR) . DIRECTORY_SEPARATOR . 'wp-content' . DIRECTORY_SEPARATOR . 'plugins' . DIRECTORY_SEPARATOR . $slug;
+    return pluginPathFromSlug($sitePath, $slug);
+}
+
+function pluginPathFromSlug(string $sitePath, string $slug): string
+{
+    validatePluginSlug($slug);
+
+    return pluginBaseDirectory($sitePath) . DIRECTORY_SEPARATOR . str_replace('/', DIRECTORY_SEPARATOR, $slug);
+}
+
+function pluginBaseDirectory(string $sitePath): string
+{
+    $pluginsDir = rtrim($sitePath, DIRECTORY_SEPARATOR) . DIRECTORY_SEPARATOR . 'wp-content' . DIRECTORY_SEPARATOR . 'plugins';
+    $realPluginsDir = realpath($pluginsDir);
+    if ($realPluginsDir === false || !is_dir($realPluginsDir)) {
+        throw new RuntimeException("WordPress plugin directory does not exist: {$pluginsDir}");
+    }
+
+    return $realPluginsDir;
+}
+
+function validatePluginSlug(string $slug): void
+{
+    if ($slug === '' || $slug[0] === '/' || str_contains($slug, "\0") || str_contains($slug, '\\') || str_contains($slug, ':')) {
+        throw new RuntimeException('Invalid plugin slug.');
+    }
+
+    foreach (explode('/', $slug) as $segment) {
+        if ($segment === '' || $segment === '.' || $segment === '..') {
+            throw new RuntimeException('Invalid plugin slug.');
+        }
+    }
+}
+
+function normalizedAbsolutePath(string $path): string
+{
+    if ($path === '') {
+        throw new RuntimeException('Path must not be empty.');
+    }
+
+    $absolute = $path[0] === DIRECTORY_SEPARATOR ? $path : getcwd() . DIRECTORY_SEPARATOR . $path;
+    $parts = [];
+    foreach (explode(DIRECTORY_SEPARATOR, $absolute) as $part) {
+        if ($part === '' || $part === '.') {
+            continue;
+        }
+
+        if ($part === '..') {
+            array_pop($parts);
+            continue;
+        }
+
+        $parts[] = $part;
+    }
+
+    return DIRECTORY_SEPARATOR . implode(DIRECTORY_SEPARATOR, $parts);
+}
+
+function pathIsWithin(string $path, string $parent): bool
+{
+    $path = rtrim(normalizedAbsolutePath($path), DIRECTORY_SEPARATOR);
+    $parent = rtrim(normalizedAbsolutePath($parent), DIRECTORY_SEPARATOR);
+
+    return $path === $parent || str_starts_with($path . DIRECTORY_SEPARATOR, $parent . DIRECTORY_SEPARATOR);
+}
+
+function ensurePrivateDirectory(string $directory): void
+{
+    ensureDirectory($directory);
+    chmod($directory, 0700);
+}
+
+function copyPath(string $source, string $destination): void
+{
+    if (is_dir($source) && !is_link($source)) {
+        copyDirectory($source, $destination);
+        return;
+    }
+
+    copyFileOrLink($source, $destination);
 }
 
 function copyDirectory(string $source, string $destination): void
 {
-    if (!is_dir($source)) {
+    if (!is_dir($source) || is_link($source)) {
         throw new RuntimeException("Source directory does not exist: {$source}");
     }
 
-    if (file_exists($destination)) {
+    if (file_exists($destination) || is_link($destination)) {
         throw new RuntimeException("Destination already exists: {$destination}");
     }
 
     ensureDirectory($destination);
+    chmod($destination, fileperms($source) & 0777);
 
     $iterator = new RecursiveIteratorIterator(
         new RecursiveDirectoryIterator($source, FilesystemIterator::SKIP_DOTS),
@@ -529,30 +669,60 @@ function copyDirectory(string $source, string $destination): void
 
     foreach ($iterator as $item) {
         $target = $destination . DIRECTORY_SEPARATOR . $iterator->getSubPathName();
-        if ($item->isLink()) {
-            $linkTarget = readlink($item->getPathname());
-            if ($linkTarget === false || !symlink($linkTarget, $target)) {
-                throw new RuntimeException("Unable to copy symlink: {$item->getPathname()}");
-            }
-            continue;
-        }
-
-        if ($item->isDir()) {
+        if ($item->isDir() && !$item->isLink()) {
             ensureDirectory($target);
+            chmod($target, $item->getPerms() & 0777);
             continue;
         }
 
-        if (!copy($item->getPathname(), $target)) {
-            throw new RuntimeException("Unable to copy file: {$item->getPathname()}");
-        }
+        copyFileOrLink($item->getPathname(), $target, $item);
+    }
+}
 
-        chmod($target, $item->getPerms() & 0777);
+function copyFileOrLink(string $source, string $destination, ?SplFileInfo $item = null): void
+{
+    if (file_exists($destination) || is_link($destination)) {
+        throw new RuntimeException("Destination already exists: {$destination}");
+    }
+
+    ensureDirectory(dirname($destination));
+
+    if (is_link($source)) {
+        $linkTarget = readlink($source);
+        if ($linkTarget === false || !symlink($linkTarget, $destination)) {
+            throw new RuntimeException("Unable to copy symlink: {$source}");
+        }
+        return;
+    }
+
+    if (!is_file($source)) {
+        throw new RuntimeException("Source file does not exist: {$source}");
+    }
+
+    if (!copy($source, $destination)) {
+        throw new RuntimeException("Unable to copy file: {$source}");
+    }
+
+    $mode = $item instanceof SplFileInfo ? $item->getPerms() : fileperms($source);
+    chmod($destination, $mode & 0777);
+    touch($destination, filemtime($source));
+}
+
+function removePath(string $path): void
+{
+    if (is_dir($path) && !is_link($path)) {
+        removeDirectory($path);
+        return;
+    }
+
+    if ((file_exists($path) || is_link($path)) && !unlink($path)) {
+        throw new RuntimeException("Unable to remove file: {$path}");
     }
 }
 
 function removeDirectory(string $directory): void
 {
-    if (!is_dir($directory)) {
+    if (!is_dir($directory) || is_link($directory)) {
         return;
     }
 
