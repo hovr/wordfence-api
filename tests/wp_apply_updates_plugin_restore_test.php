@@ -11,17 +11,84 @@ function assertApplyTrue(bool $actual, string $message): void
     }
 }
 
-function assertApplyThrows(callable $callback, string $expectedMessage, string $message): void
+function assertApplyThrows(callable $callback, string $expectedMessage, string $message): RuntimeException
 {
     try {
         $callback();
     } catch (RuntimeException $exception) {
         assertApplyTrue(strpos($exception->getMessage(), $expectedMessage) !== false, $message . ' Expected message containing: ' . $expectedMessage);
-        return;
+        return $exception;
     }
 
     fwrite(STDERR, $message . "\n");
     exit(1);
+}
+
+function writeWpStub(string $path, string $statePath, string $pluginFile, string $mode): void
+{
+    $script = <<<'PHP'
+#!/usr/bin/env php
+<?php
+$statePath = STATE_PATH;
+$pluginFile = PLUGIN_FILE;
+$mode = MODE;
+$args = array_values(array_filter(array_slice($argv, 1), static fn(string $arg): bool => strpos($arg, '--path=') !== 0));
+
+if (array_slice($args, 0, 2) === ['plugin', 'get']) {
+    $count = is_file($statePath) ? (int) file_get_contents($statePath) : 0;
+    file_put_contents($statePath, (string) ($count + 1));
+    if ($mode === 'verification_failure' && $count > 0) {
+        fwrite(STDOUT, "1.5\n");
+        exit(0);
+    }
+
+    fwrite(STDOUT, "1.0\n");
+    exit(0);
+}
+
+if (array_slice($args, 0, 2) === ['plugin', 'update']) {
+    file_put_contents($pluginFile, "<?php\n// broken update\n");
+    if ($mode === 'update_failure') {
+        fwrite(STDERR, "simulated update failure\n");
+        exit(1);
+    }
+
+    fwrite(STDOUT, "simulated update success\n");
+    exit(0);
+}
+
+fwrite(STDERR, 'unexpected command: ' . implode(' ', $args) . "\n");
+exit(1);
+PHP;
+
+    $script = str_replace(
+        ['STATE_PATH', 'PLUGIN_FILE', 'MODE'],
+        [var_export($statePath, true), var_export($pluginFile, true), var_export($mode, true)],
+        $script
+    );
+
+    file_put_contents($path, $script);
+    chmod($path, 0755);
+}
+
+function pluginUpdateFixture(string $pluginPath): array
+{
+    removeDirectory($pluginPath);
+    ensureDirectory($pluginPath);
+    file_put_contents($pluginPath . '/example-plugin.php', "<?php\n// original plugin\n");
+
+    return [
+        'type' => 'plugin',
+        'slug' => 'example-plugin',
+        'name' => 'Example Plugin',
+        'from_version' => '1.0',
+        'to_version' => '2.0',
+        'reason' => 'normal',
+        'premium_plugin' => false,
+        'status' => 'planned',
+        'stdout' => null,
+        'stderr' => null,
+    ];
 }
 
 $root = sys_get_temp_dir() . '/wp-apply-plugin-restore-' . bin2hex(random_bytes(4));
@@ -86,6 +153,34 @@ try {
         'outside wp-content/plugins',
         'Backup roots inside the plugin source should be rejected.'
     );
+
+    $wpStub = $root . '/wp-stub.php';
+    $statePath = $root . '/wp-state.txt';
+
+    $failedUpdate = pluginUpdateFixture($pluginPath);
+    writeWpStub($wpStub, $statePath, $pluginPath . '/example-plugin.php', 'update_failure');
+    assertApplyThrows(
+        static function () use ($wpStub, $sitePath, &$failedUpdate, $backupRoot): void {
+            applyUpdate($wpStub, $sitePath, $failedUpdate, null, $backupRoot);
+        },
+        'simulated update failure',
+        'WP-CLI update failures should throw.'
+    );
+    assertApplyTrue(($failedUpdate['plugin_restore']['status'] ?? null) === 'restored', 'WP-CLI update failure should restore plugin backup.');
+    assertApplyTrue(file_get_contents($pluginPath . '/example-plugin.php') === "<?php\n// original plugin\n", 'WP-CLI update failure should restore original plugin file contents.');
+    unlink($statePath);
+
+    $verificationFailure = pluginUpdateFixture($pluginPath);
+    writeWpStub($wpStub, $statePath, $pluginPath . '/example-plugin.php', 'verification_failure');
+    assertApplyThrows(
+        static function () use ($wpStub, $sitePath, &$verificationFailure, $backupRoot): void {
+            applyUpdate($wpStub, $sitePath, $verificationFailure, null, $backupRoot);
+        },
+        'installed version 1.5 is below policy target 2.0',
+        'Post-update verification failures should throw.'
+    );
+    assertApplyTrue(($verificationFailure['plugin_restore']['status'] ?? null) === 'restored', 'Post-update verification failure should restore plugin backup.');
+    assertApplyTrue(file_get_contents($pluginPath . '/example-plugin.php') === "<?php\n// original plugin\n", 'Post-update verification failure should restore original plugin file contents.');
 
     $missingBackupUpdate = [
         'type' => 'plugin',

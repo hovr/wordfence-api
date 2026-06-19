@@ -516,14 +516,13 @@ function restorePluginBackupAfterFailure(string $sitePath, array &$update, ?arra
 
         if (!rename($restoreTemp, $pluginPath)) {
             if ($failedPath !== null && (file_exists($failedPath) || is_link($failedPath)) && !file_exists($pluginPath)) {
-                rename($failedPath, $pluginPath);
+                if (!rename($failedPath, $pluginPath)) {
+                    throw new RuntimeException("Unable to move restored plugin backup into place: {$pluginPath}; original plugin also remains quarantined at {$failedPath}.");
+                }
+
                 $failedPath = null;
             }
             throw new RuntimeException("Unable to move restored plugin backup into place: {$pluginPath}");
-        }
-
-        if ($failedPath !== null) {
-            removePath($failedPath);
         }
 
         $update['plugin_restore'] = [
@@ -532,6 +531,16 @@ function restorePluginBackupAfterFailure(string $sitePath, array &$update, ?arra
             'backup' => $backupPath,
         ];
         $update['stderr'] = trim((string) ($update['stderr'] ?? '') . "\nRestored plugin files from backup after failed update.");
+
+        if ($failedPath !== null) {
+            try {
+                removePath($failedPath);
+            } catch (RuntimeException $cleanupException) {
+                $update['plugin_restore']['cleanup_status'] = 'failed';
+                $update['plugin_restore']['cleanup_stderr'] = $cleanupException->getMessage();
+                $update['stderr'] = trim((string) ($update['stderr'] ?? '') . "\nRestored plugin, but cleanup of failed update path failed: " . $cleanupException->getMessage());
+            }
+        }
     } catch (RuntimeException $exception) {
         if (file_exists($restoreTemp) || is_link($restoreTemp)) {
             removePath($restoreTemp);
@@ -590,7 +599,7 @@ function pluginBaseDirectory(string $sitePath): string
 
 function validatePluginSlug(string $slug): void
 {
-    if ($slug === '' || $slug[0] === '/' || str_contains($slug, "\0") || str_contains($slug, '\\') || str_contains($slug, ':')) {
+    if ($slug === '' || $slug[0] === '/' || strpos($slug, "\0") !== false || strpos($slug, '\\') !== false || strpos($slug, ':') !== false) {
         throw new RuntimeException('Invalid plugin slug.');
     }
 
@@ -646,13 +655,15 @@ function pathIsWithin(string $path, string $parent): bool
     $path = rtrim(normalizedAbsolutePath($path), DIRECTORY_SEPARATOR);
     $parent = rtrim(normalizedAbsolutePath($parent), DIRECTORY_SEPARATOR);
 
-    return $path === $parent || str_starts_with($path . DIRECTORY_SEPARATOR, $parent . DIRECTORY_SEPARATOR);
+    return $path === $parent || strpos($path . DIRECTORY_SEPARATOR, $parent . DIRECTORY_SEPARATOR) === 0;
 }
 
 function ensurePrivateDirectory(string $directory): void
 {
     ensureDirectory($directory);
-    chmod($directory, 0700);
+    if (!chmod($directory, 0700)) {
+        throw new RuntimeException("Unable to restrict directory permissions: {$directory}");
+    }
 }
 
 function copyPath(string $source, string $destination): void
