@@ -156,7 +156,7 @@ Options:
   --policy-settings=PATH Optional JSON settings file for apply options.
   --backup-db         Export database before applying updates.
   --backup-dir=PATH   Optional backup directory. Default: ./backups.
-  --plugin-backup-dir=PATH Optional plugin file backup directory. Default: ./plugin-backups.
+  --plugin-backup-dir=PATH Optional plugin file backup directory. Default: private system temp directory.
   --maintenance       Activate maintenance mode while applying updates.
   --core-only         Only consider WordPress core.
   --plugins-only      Only consider plugins.
@@ -608,21 +608,37 @@ function normalizedAbsolutePath(string $path): string
     }
 
     $absolute = $path[0] === DIRECTORY_SEPARATOR ? $path : getcwd() . DIRECTORY_SEPARATOR . $path;
-    $parts = [];
-    foreach (explode(DIRECTORY_SEPARATOR, $absolute) as $part) {
+    $realPath = realpath($absolute);
+    if ($realPath !== false) {
+        return $realPath;
+    }
+
+    $missing = [];
+    $candidate = $absolute;
+    while ($candidate !== '' && $candidate !== DIRECTORY_SEPARATOR && realpath($candidate) === false) {
+        array_unshift($missing, basename($candidate));
+        $candidate = dirname($candidate);
+    }
+
+    $base = realpath($candidate);
+    if ($base === false) {
+        $base = DIRECTORY_SEPARATOR;
+    }
+
+    foreach ($missing as $part) {
         if ($part === '' || $part === '.') {
             continue;
         }
 
         if ($part === '..') {
-            array_pop($parts);
+            $base = dirname($base);
             continue;
         }
 
-        $parts[] = $part;
+        $base = rtrim($base, DIRECTORY_SEPARATOR) . DIRECTORY_SEPARATOR . $part;
     }
 
-    return DIRECTORY_SEPARATOR . implode(DIRECTORY_SEPARATOR, $parts);
+    return $base;
 }
 
 function pathIsWithin(string $path, string $parent): bool
