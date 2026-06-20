@@ -687,7 +687,7 @@ function copyDirectory(string $source, string $destination): void
     }
 
     ensureDirectory($destination);
-    chmod($destination, fileperms($source) & 0777);
+    applyCopiedPathMetadata($source, $destination);
 
     $iterator = new RecursiveIteratorIterator(
         new RecursiveDirectoryIterator($source, FilesystemIterator::SKIP_DOTS),
@@ -698,7 +698,7 @@ function copyDirectory(string $source, string $destination): void
         $target = $destination . DIRECTORY_SEPARATOR . $iterator->getSubPathName();
         if ($item->isDir() && !$item->isLink()) {
             ensureDirectory($target);
-            chmod($target, $item->getPerms() & 0777);
+            applyCopiedPathMetadata($item->getPathname(), $target, $item);
             continue;
         }
 
@@ -719,6 +719,7 @@ function copyFileOrLink(string $source, string $destination, ?SplFileInfo $item 
         if ($linkTarget === false || !symlink($linkTarget, $destination)) {
             throw new RuntimeException("Unable to copy symlink: {$source}");
         }
+        applyCopiedPathMetadata($source, $destination, $item);
         return;
     }
 
@@ -730,9 +731,35 @@ function copyFileOrLink(string $source, string $destination, ?SplFileInfo $item 
         throw new RuntimeException("Unable to copy file: {$source}");
     }
 
-    $mode = $item instanceof SplFileInfo ? $item->getPerms() : fileperms($source);
-    chmod($destination, $mode & 0777);
+    applyCopiedPathMetadata($source, $destination, $item);
     touch($destination, filemtime($source));
+}
+
+function applyCopiedPathMetadata(string $source, string $destination, ?SplFileInfo $item = null): void
+{
+    $owner = $item instanceof SplFileInfo ? $item->getOwner() : fileowner($source);
+    $group = $item instanceof SplFileInfo ? $item->getGroup() : filegroup($source);
+    $mode = $item instanceof SplFileInfo ? $item->getPerms() : fileperms($source);
+
+    if (is_link($destination)) {
+        if ($owner !== false && function_exists('lchown')) {
+            @lchown($destination, $owner);
+        }
+        if ($group !== false && function_exists('lchgrp')) {
+            @lchgrp($destination, $group);
+        }
+        return;
+    }
+
+    if ($owner !== false) {
+        @chown($destination, $owner);
+    }
+    if ($group !== false) {
+        @chgrp($destination, $group);
+    }
+    if ($mode !== false) {
+        chmod($destination, $mode & 0777);
+    }
 }
 
 function removePath(string $path): void

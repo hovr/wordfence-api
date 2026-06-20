@@ -119,6 +119,8 @@ try {
     assertApplyTrue(is_file($pluginPath . '/example-plugin.php'), 'Main plugin file should be restored.');
     assertApplyTrue(is_file($pluginPath . '/includes/admin.php'), 'Nested plugin file should be restored.');
     assertApplyTrue((fileperms($pluginPath . '/includes') & 0777) === 0750, 'Nested directory permissions should be restored.');
+    assertApplyTrue(fileowner($pluginPath . '/includes/admin.php') === fileowner($backup['path'] . '/includes/admin.php'), 'Nested file owner should be restored from backup.');
+    assertApplyTrue(filegroup($pluginPath . '/includes/admin.php') === filegroup($backup['path'] . '/includes/admin.php'), 'Nested file group should be restored from backup.');
     assertApplyTrue(strpos((string) $update['stderr'], 'Restored plugin files from backup') !== false, 'Restore should be noted in stderr.');
 
     file_put_contents($singleFilePluginPath, "<?php\n// single file plugin\n");
