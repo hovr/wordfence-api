@@ -845,23 +845,41 @@ function applyCopiedPathMetadata(string $source, string $destination, ?SplFileIn
     $mode = $item instanceof SplFileInfo ? $item->getPerms() : fileperms($source);
 
     if (is_link($destination)) {
-        if ($owner !== false && function_exists('lchown')) {
-            @lchown($destination, $owner);
-        }
-        if ($group !== false && function_exists('lchgrp')) {
-            @lchgrp($destination, $group);
-        }
+        applySymlinkOwnershipMetadata($destination, $owner, $group);
         return;
     }
 
+    if ($owner !== false && !@chown($destination, $owner) && fileowner($destination) !== $owner) {
+        throw new RuntimeException("Unable to preserve owner for copied path: {$destination}");
+    }
+    if ($group !== false && !@chgrp($destination, $group) && filegroup($destination) !== $group) {
+        throw new RuntimeException("Unable to preserve group for copied path: {$destination}");
+    }
+    if ($mode !== false && (!@chmod($destination, $mode & 0777) || (fileperms($destination) & 0777) !== ($mode & 0777))) {
+        throw new RuntimeException("Unable to preserve permissions for copied path: {$destination}");
+    }
+}
+
+function applySymlinkOwnershipMetadata(string $destination, $owner, $group): void
+{
     if ($owner !== false) {
-        @chown($destination, $owner);
+        if (function_exists('lchown')) {
+            @lchown($destination, $owner);
+        }
+        $metadata = lstat($destination);
+        if (is_array($metadata) && (int) ($metadata['uid'] ?? -1) !== (int) $owner) {
+            throw new RuntimeException("Unable to preserve symlink owner for copied path: {$destination}");
+        }
     }
+
     if ($group !== false) {
-        @chgrp($destination, $group);
-    }
-    if ($mode !== false) {
-        chmod($destination, $mode & 0777);
+        if (function_exists('lchgrp')) {
+            @lchgrp($destination, $group);
+        }
+        $metadata = lstat($destination);
+        if (is_array($metadata) && (int) ($metadata['gid'] ?? -1) !== (int) $group) {
+            throw new RuntimeException("Unable to preserve symlink group for copied path: {$destination}");
+        }
     }
 }
 
