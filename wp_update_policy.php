@@ -1001,11 +1001,17 @@ function notifyPolicy(array $policy, string $outputPath, ?array $wordfenceRefres
         . ' - ' . $summary;
     $body = policyEmailBody($policy, $outputPath, $wordfenceRefresh, $counts, $groups, $dashboardJson);
     $delivery = sendUpdaterEmail($email, $subject, $body);
+    $stateError = null;
     if (!empty($delivery['sent'])) {
-        writePolicyNotificationState($statePath, updatedPolicyNotificationState($state, $emergencySignatures));
+        try {
+            writePolicyNotificationState($statePath, updatedPolicyNotificationState($state, $emergencySignatures));
+        } catch (Throwable $exception) {
+            $stateError = $exception->getMessage();
+            fwrite(STDERR, "Warning: unable to write policy notification state: {$stateError}\n");
+        }
     }
 
-    return [
+    $result = [
         'sent' => $delivery['sent'],
         'to' => $email,
         'reason' => $delivery['reason'] ?? null,
@@ -1014,6 +1020,12 @@ function notifyPolicy(array $policy, string $outputPath, ?array $wordfenceRefres
         'notification_type' => $decision['type'],
         'state_path' => $statePath,
     ];
+
+    if ($stateError !== null) {
+        $result['state_error'] = $stateError;
+    }
+
+    return $result;
 }
 
 function policyNotificationDecision(array $state, array $emergencySignatures, ?string $today = null): array
