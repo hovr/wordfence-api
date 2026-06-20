@@ -345,6 +345,14 @@ function applyUpdate(string $wpBinary, string $sitePath, array &$update, ?string
     }
 
     if ($update['type'] === 'plugin') {
+        try {
+            assertPluginUpdateWritable($sitePath, (string) $update['slug'], $wpUser);
+        } catch (RuntimeException $exception) {
+            $update['status'] = 'failed';
+            $update['stderr'] = $exception->getMessage();
+            throw $exception;
+        }
+
         $pluginBackup = backupPluginDirectory($sitePath, (string) $update['slug'], $pluginBackupDir);
         $update['plugin_backup'] = $pluginBackup;
     }
@@ -572,6 +580,101 @@ function defaultPluginBackupRoot(string $sitePath): string
         . 'wp-update-plugin-backups'
         . DIRECTORY_SEPARATOR
         . safeFileName(basename($sitePath));
+}
+
+function assertPluginUpdateWritable(string $sitePath, string $slug, ?string $wpUser): void
+{
+    $pluginPath = pluginPathFromSlug($sitePath, $slug);
+    $stderr = '';
+    $status = 0;
+    $command = [PHP_BINARY, '-r', pluginWritableCheckCode(), $pluginPath];
+    if ($wpUser !== null) {
+        $command = ['sudo', '-u', $wpUser, '--', PHP_BINARY, '-r', pluginWritableCheckCode(), $pluginPath];
+    }
+
+    runCommand($command, $stderr, $status, false, 'wp-plugin-writable-');
+    if ($status !== 0) {
+        $user = $wpUser ?? getEffectiveUserName();
+        $details = trim($stderr);
+        throw new RuntimeException("Plugin path is not writable by {$user}: {$pluginPath}" . ($details === '' ? '' : "\n{$details}"));
+    }
+}
+
+function pluginWritableCheckCode(): string
+{
+    return <<<'PHP'
+$pluginPath = $argv[1] ?? '';
+if ($pluginPath === '' || !file_exists($pluginPath)) {
+    fwrite(STDERR, "Missing plugin path: {$pluginPath}\n");
+    exit(1);
+}
+
+$failures = [];
+$describe = static function (string $path): string {
+    $owner = @fileowner($path);
+    $group = @filegroup($path);
+    $mode = @fileperms($path);
+    $ownerLabel = $owner === false ? 'unknown' : (string) $owner;
+    $groupLabel = $group === false ? 'unknown' : (string) $group;
+    if (function_exists('posix_getpwuid') && $owner !== false) {
+        $ownerInfo = @posix_getpwuid($owner);
+        if (is_array($ownerInfo) && isset($ownerInfo['name'])) {
+            $ownerLabel = (string) $ownerInfo['name'];
+        }
+    }
+    if (function_exists('posix_getgrgid') && $group !== false) {
+        $groupInfo = @posix_getgrgid($group);
+        if (is_array($groupInfo) && isset($groupInfo['name'])) {
+            $groupLabel = (string) $groupInfo['name'];
+        }
+    }
+    $modeLabel = $mode === false ? 'unknown' : substr(sprintf('%o', $mode), -4);
+    return "{$path} owner={$ownerLabel} group={$groupLabel} mode={$modeLabel}";
+};
+$check = static function (string $path) use (&$failures, $describe): void {
+    if (is_dir($path) && !is_link($path)) {
+        if (!is_writable($path) || !is_executable($path)) {
+            $failures[] = 'directory not writable/searchable: ' . $describe($path);
+        }
+        return;
+    }
+    if (!is_writable($path)) {
+        $failures[] = 'file not writable: ' . $describe($path);
+    }
+};
+
+$check(dirname($pluginPath));
+$check($pluginPath);
+if (is_dir($pluginPath) && !is_link($pluginPath)) {
+    $iterator = new RecursiveIteratorIterator(
+        new RecursiveDirectoryIterator($pluginPath, FilesystemIterator::SKIP_DOTS),
+        RecursiveIteratorIterator::SELF_FIRST
+    );
+    foreach ($iterator as $item) {
+        $check($item->getPathname());
+        if (count($failures) >= 20) {
+            break;
+        }
+    }
+}
+
+if ($failures !== []) {
+    fwrite(STDERR, implode("\n", $failures) . "\n");
+    exit(1);
+}
+PHP;
+}
+
+function getEffectiveUserName(): string
+{
+    if (function_exists('posix_geteuid') && function_exists('posix_getpwuid')) {
+        $user = posix_getpwuid(posix_geteuid());
+        if (is_array($user) && isset($user['name'])) {
+            return (string) $user['name'];
+        }
+    }
+
+    return 'current user';
 }
 
 function pluginDirectoryPath(string $sitePath, string $slug): string

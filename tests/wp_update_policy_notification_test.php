@@ -167,4 +167,62 @@ $body = policyEmailBody(
 assertContainsText('Assets with updates but still within the 168 hour delay:', $body, 'Email body should include the waiting update section.');
 assertContainsText('CORE wordpress 6.5.0 => normal_waiting to 6.5.1', $body, 'Email body should include the waiting update asset.');
 
+$today = '2026-06-20';
+assertSameValue(
+    ['send' => true, 'reason' => 'daily_notification_due', 'type' => 'daily'],
+    policyNotificationDecision([], [], $today),
+    'First policy notification of the day should send.'
+);
+assertSameValue(
+    ['send' => false, 'reason' => 'daily_notification_already_sent', 'type' => 'daily'],
+    policyNotificationDecision(['last_daily_sent_date' => $today], [], $today),
+    'Second non-emergency policy notification on the same day should be suppressed.'
+);
+
+$emergencyPluginPolicy = $waitingPolicy;
+$emergencyPluginPolicy['plugins'] = [
+    [
+        'type' => 'plugin',
+        'slug' => 'classic-editor',
+        'current_version' => '1.6.7',
+        'recommended_action' => 'emergency_update',
+        'emergency_update_version' => '1.7.0',
+    ],
+];
+$emergencySignatures = emergencyPluginNotificationSignatures($emergencyPluginPolicy);
+assertSameValue(1, count($emergencySignatures), 'Emergency plugin updates should produce a notification signature.');
+assertSameValue(
+    ['send' => true, 'reason' => 'emergency_plugin_update', 'type' => 'emergency'],
+    policyNotificationDecision(['last_daily_sent_date' => $today], $emergencySignatures, $today),
+    'A new emergency plugin update should bypass the daily notification limit.'
+);
+
+$updatedState = updatedPolicyNotificationState(['last_daily_sent_date' => $today], $emergencySignatures, $today);
+assertSameValue($today, $updatedState['last_daily_sent_date'], 'Successful notification should record the daily send date.');
+assertTrueValue(isset($updatedState['sent_emergency_signatures'][$emergencySignatures[0]]), 'Successful emergency notification should record its signature.');
+assertSameValue(
+    ['send' => false, 'reason' => 'daily_notification_already_sent', 'type' => 'daily'],
+    policyNotificationDecision($updatedState, $emergencySignatures, $today),
+    'The same emergency plugin signature should not resend on every cron run.'
+);
+
+$coreEmergencyPolicy = $waitingPolicy;
+$coreEmergencyPolicy['core']['recommended_action'] = 'emergency_update';
+$coreEmergencyPolicy['core']['emergency_update_version'] = '6.5.2';
+assertSameValue([], emergencyPluginNotificationSignatures($coreEmergencyPolicy), 'Core emergency updates should not bypass the daily plugin notification rule.');
+
+$stateRoot = sys_get_temp_dir() . '/wp-policy-notification-state-' . bin2hex(random_bytes(4));
+$statePath = policyNotificationStatePath(['site_key' => 'hfe.hovr'], ['notification-state-dir' => $stateRoot]);
+try {
+    writePolicyNotificationState($statePath, $updatedState);
+    assertSameValue($updatedState, readPolicyNotificationState($statePath), 'Notification state should round-trip through JSON.');
+} finally {
+    if (is_file($statePath)) {
+        unlink($statePath);
+    }
+    if (is_dir($stateRoot)) {
+        rmdir($stateRoot);
+    }
+}
+
 fwrite(STDOUT, "wp_update_policy notification tests passed\n");

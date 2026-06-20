@@ -132,6 +132,7 @@ Options:
   --dashboard-plugin=DIR Optional dashboard plugin folder name. Default: wp-update-dashboard.
   --policy-settings=PATH Optional JSON settings file for policy generation options.
   --notify-email=ADDR    Optional. Email policy summary after generation.
+  --notification-state-dir=PATH Optional directory for once-daily notification state.
   --no-notify            Optional. Disable policy email notification.
   --refresh-wordfence    Optional. Refresh Wordfence vulnerability DB before building policy.
   --wf-feed=VALUE        Optional with --refresh-wordfence. production or scanner. Default: production.
@@ -983,10 +984,26 @@ function notifyPolicy(array $policy, string $outputPath, ?array $wordfenceRefres
         ];
     }
 
+    $statePath = policyNotificationStatePath($policy, $options);
+    $state = readPolicyNotificationState($statePath);
+    $emergencySignatures = emergencyPluginNotificationSignatures($policy);
+    $decision = policyNotificationDecision($state, $emergencySignatures);
+    if (!$decision['send']) {
+        return [
+            'sent' => false,
+            'reason' => $decision['reason'],
+            'counts' => $counts,
+            'state_path' => $statePath,
+        ];
+    }
+
     $subject = '[WordPress Update Policy] ' . (string) ($policy['site_key'] ?? 'site')
         . ' - ' . $summary;
     $body = policyEmailBody($policy, $outputPath, $wordfenceRefresh, $counts, $groups, $dashboardJson);
     $delivery = sendUpdaterEmail($email, $subject, $body);
+    if (!empty($delivery['sent'])) {
+        writePolicyNotificationState($statePath, updatedPolicyNotificationState($state, $emergencySignatures));
+    }
 
     return [
         'sent' => $delivery['sent'],
@@ -994,7 +1011,118 @@ function notifyPolicy(array $policy, string $outputPath, ?array $wordfenceRefres
         'reason' => $delivery['reason'] ?? null,
         'transport' => $delivery['transport'] ?? null,
         'counts' => $counts,
+        'notification_type' => $decision['type'],
+        'state_path' => $statePath,
     ];
+}
+
+function policyNotificationDecision(array $state, array $emergencySignatures, ?string $today = null): array
+{
+    $today = $today ?? date('Y-m-d');
+    $sentEmergencySignatures = is_array($state['sent_emergency_signatures'] ?? null) ? $state['sent_emergency_signatures'] : [];
+    foreach ($emergencySignatures as $signature) {
+        if (!array_key_exists($signature, $sentEmergencySignatures)) {
+            return ['send' => true, 'reason' => 'emergency_plugin_update', 'type' => 'emergency'];
+        }
+    }
+
+    if (($state['last_daily_sent_date'] ?? null) === $today) {
+        return ['send' => false, 'reason' => 'daily_notification_already_sent', 'type' => 'daily'];
+    }
+
+    return ['send' => true, 'reason' => 'daily_notification_due', 'type' => 'daily'];
+}
+
+function emergencyPluginNotificationSignatures(array $policy): array
+{
+    $siteKey = (string) ($policy['site_key'] ?? 'site');
+    $signatures = [];
+    foreach (($policy['plugins'] ?? []) as $plugin) {
+        if (!is_array($plugin) || (string) ($plugin['recommended_action'] ?? '') !== 'emergency_update') {
+            continue;
+        }
+
+        $target = (string) ($plugin['emergency_update_version'] ?? '');
+        if ($target === '') {
+            continue;
+        }
+
+        $signatures[] = hash('sha256', implode('|', [
+            $siteKey,
+            (string) ($plugin['slug'] ?? ''),
+            (string) ($plugin['current_version'] ?? ''),
+            $target,
+        ]));
+    }
+
+    sort($signatures);
+    return array_values(array_unique($signatures));
+}
+
+function updatedPolicyNotificationState(array $state, array $emergencySignatures, ?string $today = null): array
+{
+    $today = $today ?? date('Y-m-d');
+    $sentEmergencySignatures = is_array($state['sent_emergency_signatures'] ?? null) ? $state['sent_emergency_signatures'] : [];
+    foreach ($emergencySignatures as $signature) {
+        $sentEmergencySignatures[$signature] = date('c');
+    }
+
+    return [
+        'last_daily_sent_date' => $today,
+        'sent_emergency_signatures' => $sentEmergencySignatures,
+        'updated_at' => date('c'),
+    ];
+}
+
+function policyNotificationStatePath(array $policy, array $options): string
+{
+    $stateDir = (string) ($options['notification-state-dir'] ?? defaultPolicyNotificationStateDir());
+    $siteKey = preg_replace('/[^A-Za-z0-9_.-]+/', '-', (string) ($policy['site_key'] ?? 'site')) ?: 'site';
+    return rtrim($stateDir, DIRECTORY_SEPARATOR) . DIRECTORY_SEPARATOR . $siteKey . '.json';
+}
+
+function defaultPolicyNotificationStateDir(): string
+{
+    return rtrim(sys_get_temp_dir(), DIRECTORY_SEPARATOR) . DIRECTORY_SEPARATOR . 'wp-update-policy-notifications';
+}
+
+function readPolicyNotificationState(string $path): array
+{
+    if (!is_file($path)) {
+        return [];
+    }
+
+    $json = file_get_contents($path);
+    if ($json === false || trim($json) === '') {
+        return [];
+    }
+
+    $state = json_decode($json, true);
+    return is_array($state) ? $state : [];
+}
+
+function writePolicyNotificationState(string $path, array $state): void
+{
+    ensureDirectory(dirname($path));
+    $json = json_encode($state, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES);
+    if ($json === false) {
+        throw new RuntimeException('Unable to encode policy notification state JSON.');
+    }
+
+    $tmpFile = tempnam(dirname($path), '.policy-notify-');
+    if ($tmpFile === false) {
+        throw new RuntimeException("Unable to create temporary notification state file in: " . dirname($path));
+    }
+
+    if (file_put_contents($tmpFile, $json . PHP_EOL) === false) {
+        @unlink($tmpFile);
+        throw new RuntimeException("Unable to write temporary notification state file: {$tmpFile}");
+    }
+
+    if (!rename($tmpFile, $path)) {
+        @unlink($tmpFile);
+        throw new RuntimeException("Unable to move temporary notification state file into place: {$path}");
+    }
 }
 
 function policyActionCounts(array $policy): array

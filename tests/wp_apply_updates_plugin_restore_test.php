@@ -123,6 +123,17 @@ try {
     assertApplyTrue(filegroup($pluginPath . '/includes/admin.php') === filegroup($backup['path'] . '/includes/admin.php'), 'Nested file group should be restored from backup.');
     assertApplyTrue(strpos((string) $update['stderr'], 'Restored plugin files from backup') !== false, 'Restore should be noted in stderr.');
 
+    assertPluginUpdateWritable($sitePath, 'example-plugin', null);
+    if (!function_exists('posix_geteuid') || posix_geteuid() !== 0) {
+        chmod($pluginPath . '/includes/admin.php', 0444);
+        assertApplyThrows(
+            static fn() => assertPluginUpdateWritable($sitePath, 'example-plugin', null),
+            'Plugin path is not writable',
+            'Unwritable plugin files should fail preflight before WP-CLI runs.'
+        );
+        chmod($pluginPath . '/includes/admin.php', 0644);
+    }
+
     file_put_contents($singleFilePluginPath, "<?php\n// single file plugin\n");
     chmod($singleFilePluginPath, 0640);
     $singleFileBackup = backupPluginDirectory($sitePath, 'hello.php', $backupRoot);
