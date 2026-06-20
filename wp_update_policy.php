@@ -1073,17 +1073,59 @@ function emergencyPluginNotificationSignatures(array $policy): array
 
 function updatedPolicyNotificationState(array $state, array $emergencySignatures, ?string $today = null): array
 {
-    $today = $today ?? date('Y-m-d');
+    $now = time();
+    $today = $today ?? date('Y-m-d', $now);
+    $sentAt = date('c', $now);
     $sentEmergencySignatures = is_array($state['sent_emergency_signatures'] ?? null) ? $state['sent_emergency_signatures'] : [];
+    $sentEmergencySignatures = prunedPolicyNotificationEmergencySignatures($sentEmergencySignatures, $now);
     foreach ($emergencySignatures as $signature) {
-        $sentEmergencySignatures[$signature] = date('c');
+        $sentEmergencySignatures[$signature] = $sentAt;
     }
+    $sentEmergencySignatures = prunedPolicyNotificationEmergencySignatures($sentEmergencySignatures, $now);
 
     return [
         'last_daily_sent_date' => $today,
         'sent_emergency_signatures' => $sentEmergencySignatures,
-        'updated_at' => date('c'),
+        'updated_at' => $sentAt,
     ];
+}
+
+function prunedPolicyNotificationEmergencySignatures(array $sentEmergencySignatures, ?int $now = null, int $retentionDays = 90, int $maxSignatures = 500): array
+{
+    $now = $now ?? time();
+    $cutoff = $now - ($retentionDays * 86400);
+    $withTimestamps = [];
+
+    foreach ($sentEmergencySignatures as $signature => $sentAt) {
+        if (!is_string($signature) || $signature === '') {
+            continue;
+        }
+
+        $timestamp = strtotime((string) $sentAt);
+        if ($timestamp === false || $timestamp < $cutoff) {
+            continue;
+        }
+
+        $withTimestamps[$signature] = [
+            'sent_at' => (string) $sentAt,
+            'timestamp' => $timestamp,
+        ];
+    }
+
+    uasort($withTimestamps, static function (array $left, array $right): int {
+        return $right['timestamp'] <=> $left['timestamp'];
+    });
+
+    if (count($withTimestamps) > $maxSignatures) {
+        $withTimestamps = array_slice($withTimestamps, 0, $maxSignatures, true);
+    }
+
+    $pruned = [];
+    foreach ($withTimestamps as $signature => $metadata) {
+        $pruned[$signature] = $metadata['sent_at'];
+    }
+
+    return $pruned;
 }
 
 function policyNotificationStatePath(array $policy, array $options): string

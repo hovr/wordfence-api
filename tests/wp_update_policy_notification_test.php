@@ -206,6 +206,21 @@ assertSameValue(
     'The same emergency plugin signature should not resend on every cron run.'
 );
 
+$now = strtotime('2026-06-20T12:00:00+00:00');
+$prunedSignatures = prunedPolicyNotificationEmergencySignatures([
+    'old-signature' => '2026-02-01T12:00:00+00:00',
+    'recent-signature' => '2026-06-19T12:00:00+00:00',
+    'invalid-signature' => 'not-a-date',
+], $now, 90, 500);
+assertSameValue(['recent-signature'], array_keys($prunedSignatures), 'Old or invalid emergency notification signatures should be pruned.');
+
+$signatureOverflow = [];
+for ($index = 0; $index < 3; $index++) {
+    $signatureOverflow['signature-' . $index] = date('c', $now - ($index * 60));
+}
+$cappedSignatures = prunedPolicyNotificationEmergencySignatures($signatureOverflow, $now, 90, 2);
+assertSameValue(['signature-0', 'signature-1'], array_keys($cappedSignatures), 'Emergency notification signature pruning should keep the newest entries when capped.');
+
 $coreEmergencyPolicy = $waitingPolicy;
 $coreEmergencyPolicy['core']['recommended_action'] = 'emergency_update';
 $coreEmergencyPolicy['core']['emergency_update_version'] = '6.5.2';
