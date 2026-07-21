@@ -133,6 +133,24 @@ function main(array $argv): void
         }
     }
 
+    if (isset($summary['error'])) {
+        try {
+            $summary['error_notification'] = notifyApplyFailure(
+                $summary,
+                $notifyEmail,
+                array_key_exists('no-notify', $options),
+                $options
+            );
+        } catch (Throwable $exception) {
+            $summary['error_notification'] = [
+                'sent' => false,
+                'reason' => 'notification_failed',
+                'error' => $exception->getMessage(),
+            ];
+            fwrite(STDERR, "Warning: unable to send update failure notification: {$exception->getMessage()}\n");
+        }
+    }
+
     echo json_encode($summary, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES) . PHP_EOL;
     exit(isset($summary['error']) ? 1 : 0);
 }
@@ -163,8 +181,10 @@ Options:
   --plugin=SLUG       Only consider one plugin slug.
   --exclude=SLUGS     Comma-separated plugin slugs to skip.
   --premium-plugins=SLUGS Comma-separated plugin slugs to update without --version.
-  --notify-email=ADDR Email for manual_review notifications.
-  --no-notify         Disable manual_review email notifications.
+  --notify-email=ADDR Email for manual-review and apply-failure notifications.
+  --no-notify         Disable manual-review and apply-failure notifications.
+  --failure-notification-hours=N Suppress identical failure emails for N hours. Default: 24. Use 0 to disable suppression.
+  --failure-notification-state-dir=PATH Optional directory for failure notification state.
   --lock-file=PATH    Optional lock file path.
   --max-policy-age=N  Maximum policy age in seconds before apply/dry-run fails. Default: 86400. Use 0 to disable.
 
@@ -1000,6 +1020,197 @@ function manualReviewEmailBody(array $manualReview, array $policy): string
     }
 
     return implode("\n", $lines);
+}
+
+function notifyApplyFailure(array $summary, string $email, bool $disabled, array $options = []): array
+{
+    if ($disabled) {
+        return ['sent' => false, 'reason' => 'disabled'];
+    }
+
+    if ($email === '') {
+        return ['sent' => false, 'reason' => 'missing_email'];
+    }
+
+    $signature = applyFailureSignature($summary);
+    $statePath = applyFailureNotificationStatePath($summary, $options);
+    $state = readApplyFailureNotificationState($statePath);
+    $hours = max(0, (int) ($options['failure-notification-hours'] ?? 24));
+    $decision = applyFailureNotificationDecision($state, $signature, time(), $hours * 3600);
+    if (!$decision['send']) {
+        return [
+            'sent' => false,
+            'reason' => $decision['reason'],
+            'to' => $email,
+            'state_path' => $statePath,
+        ];
+    }
+
+    $siteKey = (string) ($summary['site_key'] ?? 'site');
+    $mode = (string) ($summary['mode'] ?? 'unknown');
+    $subject = "[WordPress Updates] Apply failed for {$siteKey} ({$mode})";
+    $delivery = sendUpdaterEmail($email, $subject, applyFailureEmailBody($summary));
+    $stateError = null;
+    if (!empty($delivery['sent'])) {
+        try {
+            writeApplyFailureNotificationState(
+                $statePath,
+                updatedApplyFailureNotificationState($state, $signature)
+            );
+        } catch (Throwable $exception) {
+            $stateError = $exception->getMessage();
+            fwrite(STDERR, "Warning: unable to write apply failure notification state: {$stateError}\n");
+        }
+    }
+
+    $result = [
+        'sent' => !empty($delivery['sent']),
+        'to' => $email,
+        'reason' => $delivery['reason'] ?? null,
+        'transport' => $delivery['transport'] ?? null,
+        'state_path' => $statePath,
+    ];
+    if ($stateError !== null) {
+        $result['state_error'] = $stateError;
+    }
+
+    return $result;
+}
+
+function applyFailureSignature(array $summary): string
+{
+    $updates = [];
+    foreach (($summary['updates'] ?? []) as $update) {
+        if (!is_array($update)) {
+            continue;
+        }
+        $updates[] = [
+            'type' => (string) ($update['type'] ?? ''),
+            'slug' => (string) ($update['slug'] ?? ''),
+            'from_version' => (string) ($update['from_version'] ?? ''),
+            'to_version' => (string) ($update['to_version'] ?? ''),
+            'status' => (string) ($update['status'] ?? ''),
+            'stderr' => (string) ($update['stderr'] ?? ''),
+        ];
+    }
+
+    return hash('sha256', json_encode([
+        'site_key' => (string) ($summary['site_key'] ?? ''),
+        'mode' => (string) ($summary['mode'] ?? ''),
+        'error' => (string) ($summary['error'] ?? ''),
+        'updates' => $updates,
+    ], JSON_UNESCAPED_SLASHES) ?: '');
+}
+
+function applyFailureEmailBody(array $summary): string
+{
+    $lines = [
+        'A WordPress update run failed.',
+        '',
+        'Site: ' . (string) ($summary['site_key'] ?? ''),
+        'Path: ' . (string) ($summary['site_path'] ?? ''),
+        'Mode: ' . (string) ($summary['mode'] ?? ''),
+        'Policy: ' . (string) ($summary['policy'] ?? ''),
+        'Error: ' . (string) ($summary['error'] ?? 'Unknown error'),
+        '',
+    ];
+
+    foreach (($summary['updates'] ?? []) as $update) {
+        if (!is_array($update)) {
+            continue;
+        }
+        $lines[] = strtoupper((string) ($update['type'] ?? 'asset'))
+            . ' ' . (string) ($update['slug'] ?? '')
+            . ' ' . (string) ($update['from_version'] ?? '')
+            . ' => ' . (string) ($update['to_version'] ?? '')
+            . ' [' . (string) ($update['status'] ?? 'unknown') . ']';
+        if (!empty($update['stderr'])) {
+            $lines[] = (string) $update['stderr'];
+        }
+        $lines[] = '';
+    }
+
+    return implode("\n", $lines);
+}
+
+function applyFailureNotificationDecision(array $state, string $signature, ?int $now = null, int $throttleSeconds = 86400): array
+{
+    if ($throttleSeconds <= 0) {
+        return ['send' => true, 'reason' => 'suppression_disabled'];
+    }
+
+    $now = $now ?? time();
+    $sentFailures = is_array($state['sent_failures'] ?? null) ? $state['sent_failures'] : [];
+    $lastSent = isset($sentFailures[$signature]) ? strtotime((string) $sentFailures[$signature]) : false;
+    if ($lastSent !== false && ($now - $lastSent) < $throttleSeconds) {
+        return ['send' => false, 'reason' => 'identical_failure_recently_sent'];
+    }
+
+    return ['send' => true, 'reason' => 'new_or_expired_failure'];
+}
+
+function updatedApplyFailureNotificationState(array $state, string $signature, ?int $now = null): array
+{
+    $now = $now ?? time();
+    $sentFailures = is_array($state['sent_failures'] ?? null) ? $state['sent_failures'] : [];
+    $cutoff = $now - (90 * 86400);
+    foreach ($sentFailures as $existingSignature => $sentAt) {
+        $timestamp = strtotime((string) $sentAt);
+        if (!is_string($existingSignature) || $existingSignature === '' || $timestamp === false || $timestamp < $cutoff) {
+            unset($sentFailures[$existingSignature]);
+        }
+    }
+    $sentFailures[$signature] = date('c', $now);
+
+    if (count($sentFailures) > 500) {
+        uasort($sentFailures, static function ($left, $right): int {
+            return strtotime((string) $right) <=> strtotime((string) $left);
+        });
+        $sentFailures = array_slice($sentFailures, 0, 500, true);
+    }
+
+    return [
+        'sent_failures' => $sentFailures,
+        'updated_at' => date('c', $now),
+    ];
+}
+
+function applyFailureNotificationStatePath(array $summary, array $options): string
+{
+    $directory = (string) ($options['failure-notification-state-dir']
+        ?? (rtrim(sys_get_temp_dir(), DIRECTORY_SEPARATOR) . DIRECTORY_SEPARATOR . 'wp-apply-failure-notifications'));
+    $siteKey = safeFileName((string) ($summary['site_key'] ?? 'site'));
+    return rtrim($directory, DIRECTORY_SEPARATOR) . DIRECTORY_SEPARATOR . $siteKey . '.json';
+}
+
+function readApplyFailureNotificationState(string $path): array
+{
+    if (!is_file($path)) {
+        return [];
+    }
+    $json = file_get_contents($path);
+    if ($json === false || trim($json) === '') {
+        return [];
+    }
+    $state = json_decode($json, true);
+    return is_array($state) ? $state : [];
+}
+
+function writeApplyFailureNotificationState(string $path, array $state): void
+{
+    ensureDirectory(dirname($path));
+    $json = json_encode($state, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES);
+    if ($json === false) {
+        throw new RuntimeException('Unable to encode apply failure notification state JSON.');
+    }
+    $tmpFile = tempnam(dirname($path), '.apply-failure-notify-');
+    if ($tmpFile === false) {
+        throw new RuntimeException('Unable to create apply failure notification state file.');
+    }
+    if (file_put_contents($tmpFile, $json . PHP_EOL) === false || !rename($tmpFile, $path)) {
+        @unlink($tmpFile);
+        throw new RuntimeException("Unable to write apply failure notification state: {$path}");
+    }
 }
 
 function notificationEmail(array $options): string
